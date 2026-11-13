@@ -1,0 +1,37 @@
+# Python & uv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ForkTape runtime storage
+.forktape/
+*.db
+*.db-shm
+*.db-wal
+
+# Node / Web frontend source build cache (note: src/forktape/static_ui IS tracked for single-wheel distribution!)
+web/node_modules/
+web/.vite/
+web/dist/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+.env
+.env.*
