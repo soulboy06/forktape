@@ -77,6 +77,8 @@ class SessionState:
     current_step_index: int = 0
     prev_raw_request: dict[str, Any] | None = None
     diverged_live: bool = False
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+    consumed_mcp_spans: set[str] = field(default_factory=set, repr=False)
 
     def is_replaying_step(self, next_step_index: int) -> bool:
         if self.diverged_live:
@@ -89,7 +91,7 @@ class SessionState:
 
 
 class SessionManager:
-    """Thread-safe registry of active ForkTape proxy sessions."""
+    """Thread-safe & cross-process hydrated registry of active ForkTape proxy sessions."""
 
     def __init__(self, store: TapeStore) -> None:
         self.store = store
@@ -112,6 +114,7 @@ class SessionManager:
             agent_command=agent_command,
             status=TapeStatus.RUNNING,
             tags=tags or [],
+            metadata={"_session": {"mode": "record"}},
         )
         self.store.create_tape(tape)
         state = SessionState(session_id=tid, mode="record", tape_id=tid)
@@ -141,6 +144,15 @@ class SessionManager:
         label = (override_patch.label if override_patch and override_patch.label else None) or (
             f"Fork @ Step {fork_from_step}" if is_fork else "Deterministic Replay"
         )
+        child_meta = dict(src.metadata)
+        child_meta["_session"] = {
+            "mode": mode,
+            "source_tape_id": source_tape_id,
+            "fork_from_step": fork_from_step,
+            "override_patch": override_patch.model_dump() if override_patch else None,
+            "strict_matching": strict_matching,
+            "auto_fork_on_divergence": auto_fork_on_divergence,
+        }
         child_tape = TapeRecord(
             tape_id=new_tid,
             parent_tape_id=source_tape_id,
@@ -150,6 +162,7 @@ class SessionManager:
             agent_command=src.agent_command,
             status=TapeStatus.RUNNING,
             tags=list(src.tags),
+            metadata=child_meta,
         )
         self.store.create_tape(child_tape)
 
@@ -173,6 +186,24 @@ class SessionManager:
         with self._lock:
             if session_id and session_id in self._sessions:
                 return self._sessions[session_id]
+            if session_id:
+                existing_tape = self.store.get_tape(session_id)
+                if existing_tape is not None:
+                    sess_meta = existing_tape.metadata.get("_session") or {}
+                    raw_patch = sess_meta.get("override_patch")
+                    hydrated = SessionState(
+                        session_id=session_id,
+                        mode=str(sess_meta.get("mode") or ("fork" if existing_tape.fork_from_step else "record")),
+                        tape_id=existing_tape.tape_id,
+                        source_tape_id=sess_meta.get("source_tape_id") or existing_tape.parent_tape_id,
+                        fork_from_step=sess_meta.get("fork_from_step", existing_tape.fork_from_step),
+                        override_patch=OverridePatch.model_validate(raw_patch) if isinstance(raw_patch, dict) else None,
+                        strict_matching=bool(sess_meta.get("strict_matching", False)),
+                        auto_fork_on_divergence=bool(sess_meta.get("auto_fork_on_divergence", True)),
+                        current_step_index=self.store.get_max_step_index(existing_tape.tape_id),
+                    )
+                    self._sessions[session_id] = hydrated
+                    return hydrated
             if self._default_session_id and self._default_session_id in self._sessions:
                 return self._sessions[self._default_session_id]
         return self.start_record_session(title="Auto-Captured Agent Session")
@@ -193,6 +224,39 @@ class SessionManager:
 def remap_response_tool_ids_for_client(recorded_response: dict[str, Any]) -> dict[str, Any]:
     """Ensure replayed responses remain valid clean copies."""
     return copy.deepcopy(recorded_response)
+
+
+def _flatten_content_to_str(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item["text"]))
+                elif "content" in item:
+                    parts.append(_flatten_content_to_str(item["content"]))
+            else:
+                parts.append(str(item))
+        return " ".join(parts)
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _extract_all_tool_outputs_from_messages(messages: list[Any]) -> list[str]:
+    outputs: list[str] = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool":
+            outputs.append(_flatten_content_to_str(m.get("content")))
+        elif isinstance(m.get("content"), list):
+            for b in m["content"]:
+                if isinstance(b, dict) and b.get("type") == "tool_result":
+                    outputs.append(_flatten_content_to_str(b.get("content")))
+    return outputs
 
 
 class SmartOfflineStepExecutor:
@@ -216,43 +280,33 @@ class SmartOfflineStepExecutor:
         breakdown = estimate_step_token_breakdown(request)
         prompt_toks = breakdown.total
 
-        # Check metadata hints or structural signals in the request
-        sys_text = ""
-        if isinstance(request.get("system"), str):
-            sys_text = request["system"]
+        sys_text = _flatten_content_to_str(request.get("system"))
         for m in messages:
             if isinstance(m, dict) and m.get("role") in ("system", "developer"):
-                sys_text += " " + str(m.get("content", ""))
+                sys_text += " " + _flatten_content_to_str(m.get("content"))
 
         has_static_prefix = "current time:" not in sys_text.lower() and "timestamp:" not in sys_text.lower()
         cached_toks = int(prompt_toks * 0.88) if has_static_prefix and len(messages) > 2 else 0
 
-        # Determine best tool candidate from remaining tools using lexical overlap with user task
         user_query = " ".join(
-            str(m.get("content", "")) for m in messages if isinstance(m, dict) and m.get("role") == "user"
-        ).lower()
-        all_tool_outputs = " ".join(
-            str(m.get("content", "")) for m in messages if isinstance(m, dict) and m.get("role") == "tool"
-        )
-
-        # Detect if bloated uncompacted context exists (>5,000 chars of raw tool output)
-        has_context_bloat = any(
-            isinstance(m, dict)
-            and m.get("role") == "tool"
-            and len(str(m.get("content", ""))) >= 5000
-            and "_forktape_compacted" not in str(m.get("content", ""))
+            _flatten_content_to_str(m.get("content"))
             for m in messages
+            if isinstance(m, dict) and m.get("role") == "user"
+        ).lower()
+        tool_output_list = _extract_all_tool_outputs_from_messages(messages)
+        all_tool_outputs = " ".join(tool_output_list)
+
+        has_context_bloat = any(
+            len(out) >= 5000 and "_forktape_compacted" not in out for out in tool_output_list
         )
 
-        # Detect if empty retrieval occurred in immediately preceding tool message
-        from forktape.doctor.heuristics import _normalize_empty_check
-
-        last_msg = messages[-1] if messages else {}
-        last_tool_empty = (
-            isinstance(last_msg, dict)
-            and last_msg.get("role") == "tool"
-            and _normalize_empty_check(str(last_msg.get("content", "")))
+        from forktape.doctor.heuristics import (
+            _extract_preceding_tool_messages,
+            _normalize_empty_check,
         )
+
+        preceding_outs = _extract_preceding_tool_messages(request)
+        last_tool_empty = bool(preceding_outs) and all(_normalize_empty_check(x) for x in preceding_outs)
         has_grounding_guard = (
             "never fabricate" in sys_text.lower()
             or "if empty" in sys_text.lower()
@@ -262,7 +316,6 @@ class SmartOfflineStepExecutor:
 
         chosen_tool: dict[str, Any] | None = None
         if tools:
-            # Score tools; if >25 tools are loaded without pruning, distractor tools add confusion
             best_score = -1
             for t in tools:
                 fn = t.get("function") or t
@@ -271,7 +324,6 @@ class SmartOfflineStepExecutor:
                 words = set(t_name.lower().replace("_", " ").split())
                 score = sum(3 for w in words if len(w) > 2 and w in user_query)
                 score += sum(1 for w in t_desc.split() if len(w) > 4 and w in user_query)
-                # Penalize legacy/deprecated/internal distractors when pruned or guided
                 if ("deprecated" in t_desc or "internal_admin" in t_name) and len(tools) <= 12:
                     score -= 10
                 if score > best_score:
@@ -281,7 +333,6 @@ class SmartOfflineStepExecutor:
         completion_toks = 65
         elapsed_ms = max(8.5, (time.perf_counter() - t0) * 1000.0 + 14.0)
 
-        # Construct realistic response based on resolved vs unresolved failure state
         if last_tool_empty and has_grounding_guard:
             reply_text = (
                 "No matching records were returned by the search tool. "
@@ -291,7 +342,6 @@ class SmartOfflineStepExecutor:
             return resp, 6.2, elapsed_ms
 
         if chosen_tool and not last_tool_empty and len(tools) <= 15 and not has_context_bloat:
-            # Clean, focused tool invocation!
             t_name = str(chosen_tool.get("name", "resolved_action"))
             params_schema = (chosen_tool.get("parameters") or chosen_tool.get("input_schema") or {}).get(
                 "properties", {}
@@ -309,7 +359,6 @@ class SmartOfflineStepExecutor:
             resp = _build_openai_or_anthropic_text(provider, model, reply_text, prompt_toks, cached_toks, completion_toks)
             return resp, 6.0, elapsed_ms
 
-        # Otherwise still exhibits overloaded/bloated symptom
         fallback_name = str((chosen_tool or {}).get("name") or "ambiguous_fallback_tool")
         resp = _build_openai_or_anthropic_tool(
             provider,
@@ -472,13 +521,15 @@ class LiveUpstreamStepExecutor:
             req_headers.update(headers)
 
         if provider == "anthropic":
-            url = f"{self.config.anthropic_upstream}/v1/messages"
+            base = self.config.anthropic_upstream.rstrip("/")
+            url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
             api_key = os.environ.get("ANTHROPIC_API_KEY", "")
             if api_key and "x-api-key" not in {k.lower() for k in req_headers}:
                 req_headers["x-api-key"] = api_key
                 req_headers.setdefault("anthropic-version", "2023-06-01")
         else:
-            url = f"{self.config.openai_upstream}/chat/completions"
+            base = self.config.openai_upstream.rstrip("/")
+            url = f"{base}/chat/completions"
             api_key = os.environ.get("OPENAI_API_KEY", "")
             if api_key and "authorization" not in {k.lower() for k in req_headers}:
                 req_headers["Authorization"] = f"Bearer {api_key}"
@@ -584,12 +635,13 @@ class ReplayEngine:
             ttft_ms=round(replay_duration_ms * 0.5, 2),
             duration_ms=round(replay_duration_ms, 2),
             prompt_tokens=source_step.prompt_tokens,
-            cached_prompt_tokens=source_step.prompt_tokens,
+            cached_prompt_tokens=source_step.cached_prompt_tokens,
             completion_tokens=source_step.completion_tokens,
             cost_usd=0.0,
             anomaly_flags=[],
         )
         session.prev_raw_request = source_step.raw_request
+        session.current_step_index = max(session.current_step_index, source_step.step_index)
         return self.store.append_step(cloned)
 
     def build_and_store_live_step(
@@ -658,14 +710,11 @@ class ReplayEngine:
         patch: OverridePatch,
         prefer_live_upstream: bool = False,
         executor_override: StepExecutorProtocol | None = None,
+        final_status: TapeStatus = TapeStatus.SUCCESS,
     ) -> tuple[TapeRecord, TapeStep]:
-        """Instant UI / Doctor counterfactual fork at `step_index` without restarting client code!
-
-        1. Creates a forked child tape (`parent_tape_id = source_tape_id`, `fork_from_step = step_index`).
-        2. Fast-forwards Steps `1 .. step_index - 1` into the child tape with `0` Token cost.
-        3. Applies `OverridePatch` to Step `step_index` (and also applies `stabilize_prefix_cache`
-           to Step `step_index - 1` comparison baseline if requested) and executes Step `step_index`.
-        """
+        """Instant UI / Doctor counterfactual fork at `step_index` without restarting client code!"""
+        if step_index < 1:
+            raise ValueError(f"step_index must be >= 1 (got {step_index})")
         src_tape = self.store.get_tape(source_tape_id)
         if src_tape is None:
             raise KeyError(f"Tape '{source_tape_id}' not found")
@@ -681,12 +730,10 @@ class ReplayEngine:
             set_default=False,
         )
 
-        # Copy prefix steps 1 .. step_index - 1 as 0-cost deterministic VCR replays
         for s in src_steps:
             if s.step_index < step_index:
                 self.record_replayed_step_into_session(session, s, replay_duration_ms=0.8)
 
-        # Copy MCP spans prior to step_index
         for span in self.store.get_mcp_spans(source_tape_id):
             if span.step_index < step_index:
                 replayed_span = span.model_copy(
@@ -728,5 +775,5 @@ class ReplayEngine:
             override_patch=patch,
         )
 
-        updated_tape = self.sessions.complete_session(session.session_id, TapeStatus.SUCCESS)
+        updated_tape = self.sessions.complete_session(session.session_id, final_status)
         return updated_tape or self.store.get_tape(session.tape_id), forked_step  # type: ignore[return-value]

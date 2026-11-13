@@ -17,6 +17,7 @@ from forktape.models.tape import (
     BiopsyReport,
     OverridePatch,
     TapeRecord,
+    TapeStatus,
     TapeStep,
 )
 
@@ -85,12 +86,18 @@ def _did_ablation_resolve_step(
         tok_saved = orig_step.prompt_tokens - forked_step.prompt_tokens
         notes.append(f"Compacted middle tool payloads, shrinking prompt by {tok_saved:,} tokens.")
         had_bloat_flag = any(f.code == "CONTEXT_MIDDLE_LOSS" for f in findings_at_step)
+        mutated_req_str = json.dumps(forked_step.raw_request, ensure_ascii=False)
+        compacted_applied = "_forktape_compacted" in mutated_req_str or "ForkTape compacted" in mutated_req_str
         fixed_violation = (
             had_bloat_flag
             and "exceeds_policy" not in new_args_str
             and "override_cap" not in new_args_str
             and "uncompacted" not in new_args_str
-            and (orig_args_str != new_args_str or forked_step.assembled_text != orig_step.assembled_text)
+            and (
+                orig_args_str != new_args_str
+                or forked_step.assembled_text != orig_step.assembled_text
+                or (compacted_applied and tok_saved >= 800)
+            )
         )
         if fixed_violation:
             notes.append("Eliminated policy constraint amnesia caused by middle-context dilution.")
@@ -130,6 +137,18 @@ def _did_ablation_resolve_step(
     return False, notes
 
 
+def _best_step_for_code(findings: list[AnomalyFlag], code: str, fallback: int) -> int:
+    matching = [f for f in findings if f.code == code]
+    if not matching:
+        return fallback
+    critical = [f for f in matching if f.severity == "critical"]
+    chosen = critical[0] if critical else matching[0]
+    if code == "TOOL_CALL_LOOP":
+        rep = chosen.evidence.get("steps") or [chosen.step_index]
+        return int(rep[1]) if len(rep) >= 2 else chosen.step_index
+    return chosen.step_index
+
+
 def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
     """Compile the 5-node LangGraph Counterfactual Biopsy state machine."""
 
@@ -139,7 +158,6 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
         mcp_spans = store.get_mcp_spans(tape.tape_id)
         findings = scan_tape_anomalies(tape, steps, mcp_spans)
 
-        # Persist step-level anomaly badges for UI flamegraph visualization
         by_step: dict[int, list[AnomalyFlag]] = {}
         for f in findings:
             by_step.setdefault(f.step_index, []).append(f)
@@ -159,17 +177,23 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
 
     def plan_hypotheses_node(state: BiopsyGraphState) -> dict[str, Any]:
         drift_step = state["drift_step"]
+        initial_category = state.get("initial_category", "")
         findings = state.get("findings", [])
         codes_present = {f.code for f in findings}
         planned: list[PlannedHypothesis] = []
 
         if "TOOL_SCHEMA_OVERLOAD" in codes_present:
+            t_step = (
+                drift_step
+                if initial_category == "TOOL_SCHEMA_OVERLOAD"
+                else _best_step_for_code(findings, "TOOL_SCHEMA_OVERLOAD", drift_step)
+            )
             planned.append(
                 {
                     "name": "BM25 Semantic Tool Pruning (Top-5)",
                     "operator": "prune_tools_bm25",
                     "target_category": "TOOL_SCHEMA_OVERLOAD",
-                    "step_index": drift_step,
+                    "step_index": t_step,
                     "patch": OverridePatch(
                         label="Doctor: BM25 Prune Tools Top-5",
                         prune_tools_top_k=5,
@@ -179,12 +203,17 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
             )
 
         if "CONTEXT_MIDDLE_LOSS" in codes_present:
+            c_step = (
+                drift_step
+                if initial_category == "CONTEXT_MIDDLE_LOSS"
+                else _best_step_for_code(findings, "CONTEXT_MIDDLE_LOSS", drift_step)
+            )
             planned.append(
                 {
                     "name": "Structure-Aware Middle Context Compaction",
                     "operator": "compact_context",
                     "target_category": "CONTEXT_MIDDLE_LOSS",
-                    "step_index": drift_step,
+                    "step_index": c_step,
                     "patch": OverridePatch(
                         label="Doctor: Compact Tool Bloat (<=900 chars)",
                         compact_context_max_chars=900,
@@ -194,18 +223,47 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
             )
 
         if "SILENT_EMPTY_RETRIEVAL" in codes_present:
+            e_step = (
+                drift_step
+                if initial_category == "SILENT_EMPTY_RETRIEVAL"
+                else _best_step_for_code(findings, "SILENT_EMPTY_RETRIEVAL", drift_step)
+            )
             planned.append(
                 {
                     "name": "Empty-Result Grounding Guardrail",
                     "operator": "empty_retrieval_guard",
                     "target_category": "SILENT_EMPTY_RETRIEVAL",
-                    "step_index": drift_step,
+                    "step_index": e_step,
                     "patch": OverridePatch(
                         label="Doctor: Empty-Retrieval Anti-Hallucination Guard",
                         system_prompt_append=(
                             "CRITICAL GROUNDING RULE: If the preceding search/query tool returned empty results "
                             "([] or null), NEVER fabricate IDs or invoke mutation tools. Ask for clarification."
                         ),
+                        override_temperature=0.0,
+                    ),
+                }
+            )
+
+        if "TOOL_CALL_LOOP" in codes_present:
+            l_step = (
+                drift_step
+                if initial_category == "TOOL_CALL_LOOP"
+                else _best_step_for_code(findings, "TOOL_CALL_LOOP", drift_step)
+            )
+            planned.append(
+                {
+                    "name": "Cyclic Tool-Call Loop Breaker",
+                    "operator": "loop_breaker_guard",
+                    "target_category": "TOOL_CALL_LOOP",
+                    "step_index": l_step,
+                    "patch": OverridePatch(
+                        label="Doctor: Loop Breaker Guard",
+                        system_prompt_append=(
+                            "CRITICAL LOOP GUARD: Never invoke a tool with identical arguments more than once. "
+                            "If a tool already returned empty or unchanged state, summarize and stop."
+                        ),
+                        prune_tools_top_k=5,
                         override_temperature=0.0,
                     ),
                 }
@@ -226,26 +284,9 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
                 }
             )
 
-        if "TOOL_CALL_LOOP" in codes_present:
-            planned.append(
-                {
-                    "name": "Cyclic Tool-Call Loop Breaker",
-                    "operator": "loop_breaker_guard",
-                    "target_category": "TOOL_CALL_LOOP",
-                    "step_index": drift_step,
-                    "patch": OverridePatch(
-                        label="Doctor: Loop Breaker Guard",
-                        system_prompt_append=(
-                            "CRITICAL LOOP GUARD: Never invoke a tool with identical arguments more than once. "
-                            "If a tool already returned empty or unchanged state, summarize and stop."
-                        ),
-                        prune_tools_top_k=5,
-                        override_temperature=0.0,
-                    ),
-                }
-            )
+        # Ensure primary initial_category hypothesis runs FIRST so it is never truncated by [:3]
+        planned.sort(key=lambda h: 0 if h["target_category"] == initial_category else 1)
 
-        # Always ensure at least 2 controlled counterfactual runs for scientific comparison
         if len(planned) < 2:
             if not any(h["operator"] == "prune_tools_bm25" for h in planned):
                 planned.append(
@@ -300,6 +341,13 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
             resolved, notes = _did_ablation_resolve_step(
                 hyp["operator"], orig_step, forked_step, step_findings
             )
+            if not resolved:
+                store.update_tape_status(
+                    forked_tape.tape_id,
+                    TapeStatus.DIVERGED,
+                    failure_reason="Counterfactual control ablation did not resolve primary fault.",
+                )
+
             tok_before = orig_step.prompt_tokens
             tok_after = forked_step.prompt_tokens
             red_pct = round(((tok_before - tok_after) / max(1, tok_before)) * 100.0, 2)
@@ -332,23 +380,32 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
         findings = state.get("findings", [])
         ablations = state.get("ablation_results", [])
         drift_step = state["drift_step"]
-        winner_category = state["initial_category"]
+        initial_category = state["initial_category"]
+        winner_category = initial_category
         recommended_patch: OverridePatch | None = None
 
-        # Prefer an ablation experiment that empirically resolved the step failure!
         resolved_runs = [r for r in ablations if r.resolved_failure]
-        OperatorToCategory = {
+        operator_to_category = {
             "prune_tools_bm25": "TOOL_SCHEMA_OVERLOAD",
             "compact_context": "CONTEXT_MIDDLE_LOSS",
             "empty_retrieval_guard": "SILENT_EMPTY_RETRIEVAL",
             "stabilize_prefix_cache": "PREFIX_CACHE_THRASHING",
             "loop_breaker_guard": "TOOL_CALL_LOOP",
         }
-        if resolved_runs:
-            # Prefer fixing behavioral correctness at the primary drift step over pure cache optimization
-            behavioral = [r for r in resolved_runs if r.operator != "stabilize_prefix_cache"]
-            best_run = behavioral[0] if behavioral else resolved_runs[0]
-            winner_category = OperatorToCategory.get(best_run.operator, winner_category)
+        behavioral_resolved = [r for r in resolved_runs if r.operator != "stabilize_prefix_cache"]
+
+        best_run: AblationRunResult | None = None
+        if behavioral_resolved:
+            # Prefer a behavioral fix matching initial_category if multiple resolved
+            matching_initial = [
+                r for r in behavioral_resolved if operator_to_category.get(r.operator) == initial_category
+            ]
+            best_run = matching_initial[0] if matching_initial else behavioral_resolved[0]
+        elif resolved_runs and initial_category == "PREFIX_CACHE_THRASHING":
+            best_run = resolved_runs[0]
+
+        if best_run is not None:
+            winner_category = operator_to_category.get(best_run.operator, winner_category)
             drift_step = best_run.step_index
             recommended_patch = best_run.patch_applied
             confidence = 0.94

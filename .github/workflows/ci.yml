@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-ci:
+    name: Python ${{ matrix.python-version }} (Lint, Pytest, ForkBench-50 & Wheel)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --extra dev --python ${{ matrix.python-version }}
+
+      - name: Lint with Ruff
+        run: uv run --python ${{ matrix.python-version }} ruff check src tests benchmarks examples
+
+      - name: Run unit & integration test suite
+        run: uv run --python ${{ matrix.python-version }} pytest -v
+
+      - name: Verify ForkBench-50 counterfactual biopsy accuracy
+        run: uv run --python ${{ matrix.python-version }} python benchmarks/run_forkbench.py
+
+      - name: Build wheel & sdist
+        run: uv build
+
+  studio-web-build:
+    name: Web Studio Build (React 19 + TypeScript + Vite)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Typecheck & build embedded Studio SPA
+        working-directory: web
+        run: npm run build

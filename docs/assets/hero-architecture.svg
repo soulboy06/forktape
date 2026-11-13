@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 470" width="100%" height="100%" role="img" aria-label="ForkTape Architecture Diagram">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090d16"/>
+      <stop offset="50%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="cyanBrand" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#818cf8"/>
+    </linearGradient>
+    <linearGradient id="emeraldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="amberGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#ef4444"/>
+    </linearGradient>
+    <marker id="arrowCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowEmerald" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399"/>
+    </marker>
+    <marker id="arrowPurple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#a78bfa"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="470" rx="18" fill="url(#bgGrad)" stroke="#1e293b" stroke-width="2"/>
+
+  <!-- Top Header -->
+  <text x="36" y="42" fill="#f8fafc" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="20" font-weight="800" letter-spacing="0.3">
+    FORKTAPE ARCHITECTURE — Time-Travel Flight Recorder &amp; Counterfactual Biopsy Engine
+  </text>
+  <text x="36" y="64" fill="#94a3b8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12">
+    Zero-SDK Interception (OpenAI / Anthropic SSE + MCP JSON-RPC)  •  &lt;3ms Fast-Forward VCR  •  LangGraph Root-Cause Doctor  •  Pytest Compiler
+  </text>
+
+  <!-- Column 1: Any Agent Framework -->
+  <g transform="translate(32, 92)">
+    <rect width="215" height="236" rx="14" fill="#111827" stroke="#334155" stroke-width="1.5"/>
+    <rect x="14" y="14" width="187" height="28" rx="7" fill="#1e293b"/>
+    <text x="107" y="33" text-anchor="middle" fill="#e2e8f0" font-family="system-ui, sans-serif" font-size="12" font-weight="700">ANY AGENT RUNTIME</text>
+
+    <rect x="18" y="56" width="179" height="36" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="107" y="79" text-anchor="middle" fill="#38bdf8" font-family="ui-monospace, monospace" font-size="12" font-weight="600">LangGraph / OpenAI SDK</text>
+
+    <rect x="18" y="102" width="179" height="36" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="107" y="125" text-anchor="middle" fill="#a78bfa" font-family="ui-monospace, monospace" font-size="12" font-weight="600">Claude Code / AutoGen</text>
+
+    <rect x="18" y="148" width="179" height="36" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="107" y="171" text-anchor="middle" fill="#34d399" font-family="ui-monospace, monospace" font-size="12" font-weight="600">Custom Python / TS Loops</text>
+
+    <text x="107" y="212" text-anchor="middle" fill="#64748b" font-family="ui-monospace, monospace" font-size="11">forktape record -- python app.py</text>
+  </g>
+
+  <!-- Arrows Col 1 -> Col 2 -->
+  <path d="M 247 166 L 296 166" stroke="#38bdf8" stroke-width="2.2" fill="none" marker-end="url(#arrowCyan)"/>
+  <text x="271" y="158" text-anchor="middle" fill="#38bdf8" font-family="ui-monospace, monospace" font-size="10">SSE</text>
+  <path d="M 247 248 L 296 248" stroke="#34d399" stroke-width="2.2" fill="none" marker-end="url(#arrowEmerald)"/>
+  <text x="271" y="240" text-anchor="middle" fill="#34d399" font-family="ui-monospace, monospace" font-size="10">MCP</text>
+
+  <!-- Column 2: Dual-Protocol Flight Recorder -->
+  <g transform="translate(302, 92)">
+    <rect width="256" height="236" rx="14" fill="#0f172a" stroke="#0ea5e9" stroke-width="1.8"/>
+    <rect x="14" y="14" width="228" height="28" rx="7" fill="#082f49"/>
+    <text x="128" y="33" text-anchor="middle" fill="#7dd3fc" font-family="system-ui, sans-serif" font-size="12" font-weight="700">DUAL-PROTOCOL INTERCEPTOR</text>
+
+    <rect x="16" y="54" width="224" height="52" rx="8" fill="#111827" stroke="#1e293b"/>
+    <text x="28" y="74" fill="#38bdf8" font-family="system-ui, sans-serif" font-size="12" font-weight="700">LLM Stream Assembler</text>
+    <text x="28" y="93" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10.5">/v1/chat/completions &amp; /v1/messages</text>
+
+    <rect x="16" y="116" width="224" height="52" rx="8" fill="#111827" stroke="#1e293b"/>
+    <text x="28" y="136" fill="#34d399" font-family="system-ui, sans-serif" font-size="12" font-weight="700">MCP Bridge &amp; Write Sandbox</text>
+    <text x="28" y="155" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10.5">stdio + HTTP JSON-RPC • Dry-run guard</text>
+
+    <rect x="16" y="178" width="224" height="44" rx="8" fill="#111827" stroke="#334155"/>
+    <text x="28" y="197" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="11.5" font-weight="700">Canonical Fingerprint + SQLite WAL</text>
+    <text x="28" y="213" fill="#64748b" font-family="ui-monospace, monospace" font-size="10">Secret redaction • KV Prefix LCP X-Ray</text>
+  </g>
+
+  <!-- Arrow Col 2 -> Col 3 -->
+  <path d="M 558 210 L 606 210" stroke="#a78bfa" stroke-width="2.4" fill="none" marker-end="url(#arrowPurple)"/>
+
+  <!-- Column 3: Time-Travel Fork & LangGraph Doctor -->
+  <g transform="translate(612, 92)">
+    <rect width="246" height="236" rx="14" fill="#0f172a" stroke="#8b5cf6" stroke-width="1.8"/>
+    <rect x="14" y="14" width="218" height="28" rx="7" fill="#2e1065"/>
+    <text x="123" y="33" text-anchor="middle" fill="#ddd6fe" font-family="system-ui, sans-serif" font-size="12" font-weight="700">COUNTERFACTUAL ENGINE</text>
+
+    <rect x="16" y="54" width="214" height="76" rx="8" fill="#111827" stroke="#312e81"/>
+    <text x="28" y="74" fill="#c4b5fd" font-family="system-ui, sans-serif" font-size="12" font-weight="700">Time-Travel Fork @ Step K</text>
+    <text x="28" y="93" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10.5">Steps 1..K-1: 0 tok (&lt;3ms VCR)</text>
+    <text x="28" y="110" fill="#34d399" font-family="ui-monospace, monospace" font-size="10.5">Step K: Patch Prompt/Tools/Cache</text>
+
+    <rect x="16" y="140" width="214" height="82" rx="8" fill="#111827" stroke="#4c1d95"/>
+    <text x="28" y="160" fill="#f472b6" font-family="system-ui, sans-serif" font-size="12" font-weight="700">LangGraph Biopsy Doctor</text>
+    <text x="28" y="179" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="10">1. Scan 5 Failure Heuristics</text>
+    <text x="28" y="195" fill="#cbd5e1" font-family="ui-monospace, monospace" font-size="10">2. Locate Causal Drift Step</text>
+    <text x="28" y="211" fill="#34d399" font-family="ui-monospace, monospace" font-size="10">3. Run Ablations &amp; Prove Fix</text>
+  </g>
+
+  <!-- Arrow Col 3 -> Col 4 -->
+  <path d="M 858 210 L 902 210" stroke="#34d399" stroke-width="2.4" fill="none" marker-end="url(#arrowEmerald)"/>
+
+  <!-- Column 4: Developer Outputs -->
+  <g transform="translate(908, 92)">
+    <rect width="180" height="236" rx="14" fill="#111827" stroke="#10b981" stroke-width="1.6"/>
+    <rect x="14" y="14" width="152" height="28" rx="7" fill="#064e3b"/>
+    <text x="90" y="33" text-anchor="middle" fill="#6ee7b7" font-family="system-ui, sans-serif" font-size="12" font-weight="700">CI &amp; DEV SURFACES</text>
+
+    <rect x="14" y="54" width="152" height="50" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="90" y="75" text-anchor="middle" fill="#38bdf8" font-family="system-ui, sans-serif" font-size="12" font-weight="700">Web Studio UI</text>
+    <text x="90" y="92" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">forktape demo / ui</text>
+
+    <rect x="14" y="114" width="152" height="50" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="90" y="135" text-anchor="middle" fill="#34d399" font-family="system-ui, sans-serif" font-size="12" font-weight="700">Pytest Compiler</text>
+    <text x="90" y="152" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">0-API-cost CI tests</text>
+
+    <rect x="14" y="174" width="152" height="50" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="90" y="195" text-anchor="middle" fill="#c084fc" font-family="system-ui, sans-serif" font-size="12" font-weight="700">MCP Server</text>
+    <text x="90" y="212" text-anchor="middle" fill="#94a3b8" font-family="ui-monospace, monospace" font-size="10">Claude Code / Cursor</text>
+  </g>
+
+  <!-- Bottom Timeline Fork Ribbon -->
+  <g transform="translate(32, 350)">
+    <rect width="1056" height="92" rx="12" fill="#0b1324" stroke="#1e293b" stroke-width="1.5"/>
+    <text x="22" y="26" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="11.5" font-weight="700">
+      TIME-TRAVEL FORKING TIMELINE (EXAMPLE: STEP 5 DRIFT ON 8-STEP AGENT RUN — SAVES 89.4% DEBUGGING TOKENS)
+    </text>
+
+    <!-- Original branch -->
+    <line x1="46" y1="52" x2="540" y2="52" stroke="#475569" stroke-width="2.5"/>
+    <circle cx="60" cy="52" r="7" fill="#22d3ee"/>
+    <text x="60" y="75" text-anchor="middle" fill="#64748b" font-family="ui-monospace, monospace" font-size="10">S1 (VCR)</text>
+    <circle cx="155" cy="52" r="7" fill="#22d3ee"/>
+    <text x="155" y="75" text-anchor="middle" fill="#64748b" font-family="ui-monospace, monospace" font-size="10">S2 (VCR)</text>
+    <circle cx="250" cy="52" r="7" fill="#22d3ee"/>
+    <text x="250" y="75" text-anchor="middle" fill="#64748b" font-family="ui-monospace, monospace" font-size="10">S3 (VCR)</text>
+    <circle cx="345" cy="52" r="7" fill="#22d3ee"/>
+    <text x="345" y="75" text-anchor="middle" fill="#64748b" font-family="ui-monospace, monospace" font-size="10">S4 (VCR)</text>
+
+    <!-- Drift point S5 -->
+    <circle cx="445" cy="52" r="9" fill="url(#amberGrad)" stroke="#fef08a" stroke-width="2"/>
+    <text x="445" y="76" text-anchor="middle" fill="#fbbf24" font-family="ui-monospace, monospace" font-size="10.5" font-weight="700">S5 DRIFT</text>
+
+    <!-- Failed continuation -->
+    <line x1="454" y1="52" x2="650" y2="42" stroke="#ef4444" stroke-width="2" stroke-dasharray="5,4"/>
+    <circle cx="658" cy="42" r="6" fill="#ef4444"/>
+    <text x="674" y="46" fill="#f87171" font-family="ui-monospace, monospace" font-size="10.5">Original: Wrong tool / Context rot / Loop</text>
+
+    <!-- Forked healed branch -->
+    <path d="M 454 52 C 500 52, 510 72, 650 72" stroke="#10b981" stroke-width="2.8" fill="none"/>
+    <circle cx="658" cy="72" r="7" fill="url(#emeraldGrad)"/>
+    <text x="674" y="76" fill="#34d399" font-family="ui-monospace, monospace" font-size="11" font-weight="700">Forked Branch: BM25 Pruned / Compacted → Verified Fix + Pytest Exported</text>
+  </g>
+</svg>

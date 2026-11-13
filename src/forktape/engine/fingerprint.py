@@ -18,10 +18,18 @@ from forktape.models.tape import StepTokenBreakdown
 # ---------------------------------------------------------------------------
 SECRET_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"Bearer\s+[A-Za-z0-9._\-]{16,}"), "Bearer <REDACTED_TOKEN>"),
-    (re.compile(r"\bsk-(?:ant|proj|live|test)?-?[A-Za-z0-9_\-]{16,}\b"), "<REDACTED_API_KEY>"),
+    (re.compile(r"\bsk-(?:ant|proj|svcacct|live|test)?-?[A-Za-z0-9_\-]{16,}\b"), "<REDACTED_API_KEY>"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "<REDACTED_GITHUB_TOKEN>"),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<REDACTED_AWS_KEY>"),
-    (re.compile(r"(?i)(api[_-]?key|secret|password|authorization)\s*[:=]\s*['\"]?[A-Za-z0-9_\-./+=]{12,}['\"]?"), r"\1=<REDACTED_SECRET>"),
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "<REDACTED_AWS_KEY>"),
+    (re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b"), "<REDACTED_GOOGLE_KEY>"),
+    (re.compile(r"\bhf_[A-Za-z0-9]{30,}\b"), "<REDACTED_HF_TOKEN>"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"), "<REDACTED_SLACK_TOKEN>"),
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|secret|password|authorization)\s*[:=]\s*(?:'[^'\s]{12,}'|\"[^\"\s]{12,}\"|(?![A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_])[A-Za-z0-9_\-/+=]{16,})(?!\s*\()"
+        ),
+        r"\1=<REDACTED_SECRET>",
+    ),
 ]
 
 SENSITIVE_HEADER_KEYS = {
@@ -41,7 +49,7 @@ ISO_TIMESTAMP_RE = re.compile(
     r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"
 )
 UUID_RE = re.compile(
-    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"
 )
 EPOCH_MS_KEY_NAMES = {
     "timestamp",
@@ -74,7 +82,10 @@ def redact_payload(obj: Any) -> Any:
     if isinstance(obj, dict):
         cleaned: dict[str, Any] = {}
         for k, v in obj.items():
-            if str(k).lower() in SENSITIVE_HEADER_KEYS:
+            is_scalar_or_str_list = isinstance(v, (str, int, float)) or (
+                isinstance(v, list) and bool(v) and all(isinstance(x, str) for x in v)
+            )
+            if str(k).lower() in SENSITIVE_HEADER_KEYS and is_scalar_or_str_list:
                 cleaned[k] = "<REDACTED_HEADER>"
             else:
                 cleaned[k] = redact_payload(v)

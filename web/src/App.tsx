@@ -68,6 +68,7 @@ export default function App() {
   const [compactMaxChars, setCompactMaxChars] = useState(900);
   const [stabilizeCache, setStabilizeCache] = useState(true);
   const [dryRunWrites, setDryRunWrites] = useState(true);
+  const [preferLiveUpstream, setPreferLiveUpstream] = useState(false);
   const [appendSystemRule, setAppendSystemRule] = useState("");
   const [swapModel, setSwapModel] = useState("");
 
@@ -110,6 +111,18 @@ export default function App() {
         d.steps[d.steps.length - 1]?.step_index ||
         1;
       setSelectedStepIdx(driftStep);
+
+      const recPatch = d.biopsy_report?.recommended_patch;
+      if (recPatch) {
+        setEnablePruneTools(recPatch.prune_tools_top_k != null);
+        if (recPatch.prune_tools_top_k != null) setPruneTopK(recPatch.prune_tools_top_k);
+        setEnableCompactContext(recPatch.compact_context_max_chars != null);
+        if (recPatch.compact_context_max_chars != null) {
+          setCompactMaxChars(recPatch.compact_context_max_chars);
+        }
+        setStabilizeCache(Boolean(recPatch.stabilize_prefix_cache));
+        setAppendSystemRule(recPatch.system_prompt_append || "");
+      }
 
       if (d.biopsy_report?.generated_pytest_code) {
         setPytestCode(d.biopsy_report.generated_pytest_code);
@@ -233,7 +246,7 @@ export default function App() {
         body: JSON.stringify({
           step_index: selectedStep.step_index,
           patch,
-          prefer_live_upstream: false,
+          prefer_live_upstream: preferLiveUpstream,
         }),
       });
       if (!resp.ok) throw new Error(`Fork failed: HTTP ${resp.status}`);
@@ -252,7 +265,16 @@ export default function App() {
 
   const handleCopyPytest = async () => {
     if (!pytestCode) return;
-    await navigator.clipboard.writeText(pytestCode);
+    try {
+      await navigator.clipboard.writeText(pytestCode);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = pytestCode;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
     setCopiedPytest(true);
     setTimeout(() => setCopiedPytest(false), 1800);
   };
@@ -281,7 +303,7 @@ export default function App() {
         <div className="flex items-center gap-3 text-xs text-slate-400 font-mono">
           <span className="hidden md:inline-flex items-center gap-1.5 bg-slate-900 border border-slate-800 px-2.5 py-1 rounded">
             <Terminal className="w-3.5 h-3.5 text-emerald-400" />
-            OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+            OPENAI_BASE_URL={typeof window !== "undefined" ? window.location.origin : "http://127.0.0.1:18787"}/v1
           </span>
           <button
             onClick={() => void loadTapes(true)}
@@ -375,7 +397,7 @@ export default function App() {
 
                   {kids.length > 0 && (
                     <div className="bg-[#090c12] border-t border-slate-800/40 pl-4 pr-2 py-1.5 space-y-1">
-                      {kids.slice(0, 4).map((child) => (
+                      {[...kids].reverse().slice(0, 8).map((child) => (
                         <button
                           key={child.tape_id}
                           onClick={() => setSelectedTapeId(child.tape_id)}
@@ -839,11 +861,20 @@ export default function App() {
                           {detail.tape.step_count}
                         </div>
                         <p className="text-slate-300">
-                          Steps <strong>1..{Math.max(0, selectedStep.step_index - 1)}</strong> will
-                          fast-forward deterministically from SQLite in{" "}
-                          <strong>&lt;3ms with 0 Token cost &amp; 0 MCP side effects</strong>. Step{" "}
-                          <strong>{selectedStep.step_index}</strong> will re-execute with your
-                          patches below.
+                          {selectedStep.step_index > 1 ? (
+                            <>
+                              Steps <strong>1..{selectedStep.step_index - 1}</strong> will
+                              fast-forward deterministically from SQLite in{" "}
+                              <strong>&lt;3ms with 0 Token cost &amp; 0 MCP side effects</strong>.
+                              Step <strong>{selectedStep.step_index}</strong> will re-execute with
+                              your patches below.
+                            </>
+                          ) : (
+                            <>
+                              Step <strong>1</strong> executes directly with your counterfactual
+                              patches below (no prior prefix steps to replay).
+                            </>
+                          )}
                         </p>
                       </div>
 
@@ -946,12 +977,25 @@ export default function App() {
                         <label className="flex items-center justify-between gap-3 text-xs cursor-pointer">
                           <span>
                             <strong>MCP Dry-Run Write Sandbox</strong> — block destructive mutations
-                            (`delete_*`, `send_*`)
+                            (`delete_*`, `wipe_*`, `send_*`)
                           </span>
                           <input
                             type="checkbox"
                             checked={dryRunWrites}
                             onChange={(e) => setDryRunWrites(e.target.checked)}
+                          />
+                        </label>
+
+                        <label className="flex items-center justify-between gap-3 text-xs cursor-pointer">
+                          <span>
+                            <strong>Prefer Live Upstream LLM API</strong> — call live API if{" "}
+                            <code className="text-cyan-300">OPENAI_API_KEY</code> /{" "}
+                            <code className="text-cyan-300">ANTHROPIC_API_KEY</code> is configured
+                          </span>
+                          <input
+                            type="checkbox"
+                            checked={preferLiveUpstream}
+                            onChange={(e) => setPreferLiveUpstream(e.target.checked)}
                           />
                         </label>
                       </div>
@@ -1137,6 +1181,44 @@ export default function App() {
                         </div>
                         <pre className="text-[11px] font-mono text-slate-300 overflow-x-auto max-h-96">
                           {JSON.stringify(selectedStep.raw_request, null, 2)}
+                        </pre>
+                      </div>
+
+                      {selectedStep.reasoning_text && (
+                        <div className="rounded border border-purple-700/40 bg-purple-950/15 p-3 space-y-1.5">
+                          <div className="font-mono text-[11px] text-purple-300 uppercase font-bold">
+                            Extended Thinking / Reasoning Trace
+                          </div>
+                          <pre className="text-[11px] font-mono text-purple-100 whitespace-pre-wrap">
+                            {selectedStep.reasoning_text}
+                          </pre>
+                        </div>
+                      )}
+
+                      {detail.mcp_spans.filter((sp) => sp.step_index === selectedStep.step_index)
+                        .length > 0 && (
+                        <div className="rounded border border-emerald-700/40 bg-emerald-950/15 p-3 space-y-2">
+                          <div className="font-mono text-[11px] text-emerald-300 uppercase font-bold">
+                            Recorded MCP JSON-RPC Spans @ Step {selectedStep.step_index}
+                          </div>
+                          <pre className="text-[11px] font-mono text-emerald-200 overflow-x-auto max-h-64">
+                            {JSON.stringify(
+                              detail.mcp_spans.filter(
+                                (sp) => sp.step_index === selectedStep.step_index
+                              ),
+                              null,
+                              2
+                            )}
+                          </pre>
+                        </div>
+                      )}
+
+                      <div className="rounded border border-slate-800 bg-slate-950 p-3 space-y-2">
+                        <div className="font-mono text-[11px] text-slate-400 uppercase font-bold">
+                          Raw LLM Response Payload
+                        </div>
+                        <pre className="text-[11px] font-mono text-slate-300 overflow-x-auto max-h-96">
+                          {JSON.stringify(selectedStep.raw_response, null, 2)}
                         </pre>
                       </div>
                     </div>

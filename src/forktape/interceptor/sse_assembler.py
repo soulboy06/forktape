@@ -9,6 +9,23 @@ from typing import Any
 from forktape.models.tape import ToolCallInvocation
 
 
+def _coerce_tool_args(raw: Any) -> dict[str, Any] | str:
+    """Coerce arbitrary tool argument payloads safely into `dict[str, Any] | str`."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                return loaded
+        except ValueError:
+            pass
+        return raw
+    if raw is None:
+        return {}
+    return json.dumps(raw, ensure_ascii=False)
+
+
 class OpenAISSEAssembler:
     """Reconstructs a full ChatCompletion object from OpenAI-compatible SSE lines."""
 
@@ -65,9 +82,9 @@ class OpenAISSEAssembler:
         if not isinstance(delta, dict):
             return
 
-        if delta.get("content"):
+        if delta.get("content") is not None and delta.get("content") != "":
             self.content_parts.append(str(delta["content"]))
-        if delta.get("reasoning_content"):
+        if delta.get("reasoning_content") is not None and delta.get("reasoning_content") != "":
             self.reasoning_parts.append(str(delta["reasoning_content"]))
 
         tcs = delta.get("tool_calls")
@@ -98,13 +115,7 @@ class OpenAISSEAssembler:
             buf = self.tool_call_buffers[idx]
             tc_id = buf["id"] or f"call_{uuid.uuid4().hex[:10]}"
             raw_args = buf["arguments"] or "{}"
-            parsed_args: dict[str, Any] | str = raw_args
-            try:
-                loaded = json.loads(raw_args)
-                if isinstance(loaded, dict):
-                    parsed_args = loaded
-            except ValueError:
-                pass
+            parsed_args = _coerce_tool_args(raw_args)
             openai_tool_calls.append(
                 {
                     "id": tc_id,
@@ -168,14 +179,7 @@ def extract_from_openai_json(
                     continue
                 fn = tc.get("function") or {}
                 raw_args = fn.get("arguments", "{}")
-                parsed_args: dict[str, Any] | str = raw_args
-                if isinstance(raw_args, str):
-                    try:
-                        loaded = json.loads(raw_args)
-                        if isinstance(loaded, dict):
-                            parsed_args = loaded
-                    except ValueError:
-                        pass
+                parsed_args = _coerce_tool_args(raw_args)
                 invocations.append(
                     ToolCallInvocation(
                         id=str(tc.get("id") or f"call_{uuid.uuid4().hex[:8]}"),
@@ -205,7 +209,6 @@ def synthesize_openai_sse_chunks(response: dict[str, Any]) -> list[bytes]:
 
     frames: list[bytes] = []
 
-    # Role opener frame
     opener = {
         "id": resp_id,
         "object": "chat.completion.chunk",
@@ -314,16 +317,22 @@ class AnthropicSSEAssembler:
             cb = ev.get("content_block") or {}
             btype = cb.get("type", "text")
             if btype == "tool_use":
+                initial_input = cb.get("input")
                 self.blocks[idx] = {
                     "type": "tool_use",
                     "id": cb.get("id", f"toolu_{idx}"),
                     "name": cb.get("name", ""),
+                    "_initial_input": initial_input if isinstance(initial_input, dict) and initial_input else None,
                     "_raw_json": "",
                 }
             elif btype == "thinking":
-                self.blocks[idx] = {"type": "thinking", "thinking": ""}
+                self.blocks[idx] = {
+                    "type": "thinking",
+                    "thinking": str(cb.get("thinking") or ""),
+                    "signature": str(cb.get("signature") or ""),
+                }
             else:
-                self.blocks[idx] = {"type": "text", "text": ""}
+                self.blocks[idx] = {"type": "text", "text": str(cb.get("text") or "")}
         elif etype == "content_block_delta":
             idx = int(ev.get("index", 0))
             delta = ev.get("delta") or {}
@@ -333,6 +342,8 @@ class AnthropicSSEAssembler:
                 block["text"] = block.get("text", "") + str(delta.get("text", ""))
             elif dtype == "thinking_delta":
                 block["thinking"] = block.get("thinking", "") + str(delta.get("thinking", ""))
+            elif dtype == "signature_delta":
+                block["signature"] = block.get("signature", "") + str(delta.get("signature", ""))
             elif dtype == "input_json_delta":
                 block["_raw_json"] = block.get("_raw_json", "") + str(delta.get("partial_json", ""))
         elif etype == "message_delta":
@@ -356,23 +367,31 @@ class AnthropicSSEAssembler:
                 content_list.append({"type": "text", "text": b.get("text", "")})
             elif b["type"] == "thinking":
                 thinking_parts.append(b.get("thinking", ""))
-                content_list.append({"type": "thinking", "thinking": b.get("thinking", "")})
+                t_block: dict[str, Any] = {"type": "thinking", "thinking": b.get("thinking", "")}
+                if b.get("signature"):
+                    t_block["signature"] = b["signature"]
+                content_list.append(t_block)
             elif b["type"] == "tool_use":
-                raw_json = b.get("_raw_json") or "{}"
-                try:
-                    parsed_input = json.loads(raw_json)
-                except ValueError:
-                    parsed_input = {}
+                raw_json = b.get("_raw_json") or ""
+                if raw_json:
+                    coerced_args = _coerce_tool_args(raw_json)
+                    block_input = coerced_args if isinstance(coerced_args, dict) else {"_raw_arguments": coerced_args}
+                elif b.get("_initial_input") is not None:
+                    coerced_args = b["_initial_input"]
+                    block_input = b["_initial_input"]
+                else:
+                    coerced_args = {}
+                    block_input = {}
                 content_list.append(
                     {
                         "type": "tool_use",
                         "id": b["id"],
                         "name": b["name"],
-                        "input": parsed_input,
+                        "input": block_input,
                     }
                 )
                 invocations.append(
-                    ToolCallInvocation(id=b["id"], name=b["name"], arguments=parsed_input)
+                    ToolCallInvocation(id=b["id"], name=b["name"], arguments=coerced_args)
                 )
 
         total_prompt = self.input_tokens + self.cached_tokens
@@ -413,7 +432,7 @@ def extract_from_anthropic_json(
                 ToolCallInvocation(
                     id=str(block.get("id") or ""),
                     name=str(block.get("name") or ""),
-                    arguments=block.get("input") or {},
+                    arguments=_coerce_tool_args(block.get("input")),
                 )
             )
 
@@ -460,6 +479,7 @@ def synthesize_anthropic_sse_chunks(response: dict[str, Any]) -> list[bytes]:
                     "input": {},
                 },
             }
+            frames.append(f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n".encode())
             cb_delta = {
                 "type": "content_block_delta",
                 "index": idx,
@@ -468,20 +488,44 @@ def synthesize_anthropic_sse_chunks(response: dict[str, Any]) -> list[bytes]:
                     "partial_json": json.dumps(block.get("input", {}), ensure_ascii=False),
                 },
             }
+            frames.append(f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n".encode())
+        elif btype == "thinking":
+            cb_start = {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": ""},
+            }
+            frames.append(f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n".encode())
+            cb_delta = {
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "thinking_delta", "thinking": block.get("thinking", "")},
+            }
+            frames.append(f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n".encode())
+            if block.get("signature"):
+                sig_delta = {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "signature_delta", "signature": block["signature"]},
+                }
+                frames.append(
+                    f"event: content_block_delta\ndata: {json.dumps(sig_delta, ensure_ascii=False)}\n\n".encode()
+                )
         else:
             cb_start = {
                 "type": "content_block_start",
                 "index": idx,
                 "content_block": {"type": "text", "text": ""},
             }
+            frames.append(f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n".encode())
             cb_delta = {
                 "type": "content_block_delta",
                 "index": idx,
                 "delta": {"type": "text_delta", "text": block.get("text", "")},
             }
+            frames.append(f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n".encode())
+
         cb_stop = {"type": "content_block_stop", "index": idx}
-        frames.append(f"event: content_block_start\ndata: {json.dumps(cb_start, ensure_ascii=False)}\n\n".encode())
-        frames.append(f"event: content_block_delta\ndata: {json.dumps(cb_delta, ensure_ascii=False)}\n\n".encode())
         frames.append(f"event: content_block_stop\ndata: {json.dumps(cb_stop, ensure_ascii=False)}\n\n".encode())
 
     msg_delta = {

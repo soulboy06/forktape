@@ -20,6 +20,9 @@ DESTRUCTIVE_TOOL_PREFIXES = (
     "remove_",
     "destroy_",
     "truncate_",
+    "wipe_",
+    "rollback_",
+    "purge_",
     "send_email",
     "send_message",
     "transfer_",
@@ -41,6 +44,10 @@ class MCPInterceptor:
     def __init__(self, replay_engine: ReplayEngine) -> None:
         self.engine = replay_engine
 
+    def _effective_step_index(self, session: SessionState) -> int:
+        db_max = self.engine.store.get_max_step_index(session.tape_id)
+        return max(1, session.current_step_index, db_max)
+
     def try_vcr_or_sandbox_intercept(
         self,
         session: SessionState,
@@ -53,16 +60,25 @@ class MCPInterceptor:
         rpc_id = rpc_request.get("id")
         params = rpc_request.get("params") or {}
 
-        if method != "tools/call":
+        if method not in ("tools/call", "tools/list", "resources/read"):
             return None
 
-        tool_name = str(params.get("name") or "")
-        arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
-        step_idx = max(1, session.current_step_index)
+        tool_name = str(params.get("name") or params.get("uri") or method)
+        arguments = (
+            params.get("arguments")
+            if isinstance(params.get("arguments"), dict)
+            else (params if isinstance(params, dict) else {})
+        )
+        step_idx = self._effective_step_index(session)
 
         # 1. Explicit mock override in OverridePatch
         patch = session.override_patch
-        if patch and tool_name in patch.mock_tool_outputs and not session.is_replaying_step(step_idx):
+        if (
+            method == "tools/call"
+            and patch
+            and tool_name in patch.mock_tool_outputs
+            and not session.is_replaying_step(step_idx)
+        ):
             mock_val = patch.mock_tool_outputs[tool_name]
             self.engine.store.append_mcp_span(
                 MCPSpan(
@@ -89,18 +105,29 @@ class MCPInterceptor:
 
         # 2. Deterministic VCR Replay for steps prior to fork_from_step (Zero DB/API Side Effects!)
         if session.source_tape_id and session.is_replaying_step(step_idx):
-            arg_hash = canonical_request_hash({"tool": tool_name, "args": arguments})
+            arg_hash = canonical_request_hash({"method": method, "tool": tool_name, "args": arguments})
             candidates = self.engine.store.get_mcp_spans(session.source_tape_id)
+            unconsumed = [sp for sp in candidates if sp.span_id not in session.consumed_mcp_spans]
+            pool = unconsumed or candidates
+
             matched: MCPSpan | None = None
-            for sp in candidates:
-                sp_hash = canonical_request_hash({"tool": sp.tool_name, "args": sp.arguments})
-                if sp.tool_name == tool_name and sp_hash == arg_hash:
+            # Prefer exact (step_index, tool_name, arg_hash) match first
+            for sp in pool:
+                sp_hash = canonical_request_hash({"method": sp.method, "tool": sp.tool_name, "args": sp.arguments})
+                if sp.step_index == step_idx and sp.tool_name == tool_name and sp_hash == arg_hash:
                     matched = sp
                     break
             if matched is None:
-                matched = next((sp for sp in candidates if sp.tool_name == tool_name), None)
+                for sp in pool:
+                    sp_hash = canonical_request_hash({"method": sp.method, "tool": sp.tool_name, "args": sp.arguments})
+                    if sp.tool_name == tool_name and sp_hash == arg_hash:
+                        matched = sp
+                        break
+            if matched is None:
+                matched = next((sp for sp in pool if sp.tool_name == tool_name and sp.method == method), None)
 
             if matched is not None:
+                session.consumed_mcp_spans.add(matched.span_id)
                 self.engine.store.append_mcp_span(
                     MCPSpan(
                         tape_id=session.tape_id,
@@ -117,7 +144,7 @@ class MCPInterceptor:
                     )
                 )
                 result_payload = matched.result
-                if isinstance(result_payload, dict) and "content" in result_payload:
+                if method != "tools/call" or (isinstance(result_payload, dict) and "content" in result_payload):
                     rpc_result = result_payload
                 else:
                     rpc_result = {
@@ -136,7 +163,7 @@ class MCPInterceptor:
                 return {"jsonrpc": "2.0", "id": rpc_id, "result": rpc_result}
 
         # 3. Dry-Run Write Guardrail during live forks
-        if patch and patch.dry_run_write_tools and is_destructive_tool(tool_name):
+        if method == "tools/call" and patch and patch.dry_run_write_tools and is_destructive_tool(tool_name):
             sandbox_msg = {
                 "_forktape_dry_run_blocked": True,
                 "tool": tool_name,
@@ -189,7 +216,7 @@ class MCPInterceptor:
 
         span = MCPSpan(
             tape_id=session.tape_id,
-            step_index=max(1, session.current_step_index),
+            step_index=self._effective_step_index(session),
             server_name=server_name,
             transport=transport,
             method=method,
@@ -241,6 +268,7 @@ async def run_stdio_mcp_bridge(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=sys.stderr,
+        limit=16 * 1024 * 1024,
     )
     assert proc.stdin is not None and proc.stdout is not None
 
@@ -251,13 +279,19 @@ async def run_stdio_mcp_bridge(
         while True:
             line = await loop.run_in_executor(None, sys.stdin.buffer.readline)
             if not line:
-                proc.stdin.close()
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
                 break
             try:
                 rpc_req = json.loads(line.decode("utf-8"))
             except ValueError:
-                proc.stdin.write(line)
-                await proc.stdin.drain()
+                try:
+                    proc.stdin.write(line)
+                    await proc.stdin.drain()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
                 continue
 
             session = replay_engine.sessions.resolve_session(session_id)
@@ -273,8 +307,11 @@ async def run_stdio_mcp_bridge(
             if "id" in rpc_req:
                 pending_requests[rpc_req["id"]] = (rpc_req, time.perf_counter())
 
-            proc.stdin.write(line)
-            await proc.stdin.drain()
+            try:
+                proc.stdin.write(line)
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                break
 
     async def pump_server_to_client() -> None:
         while True:
@@ -297,5 +334,9 @@ async def run_stdio_mcp_bridge(
             sys.stdout.buffer.write(line)
             sys.stdout.buffer.flush()
 
-    await asyncio.gather(pump_client_to_server(), pump_server_to_client())
+    t_in = asyncio.create_task(pump_client_to_server())
+    t_out = asyncio.create_task(pump_server_to_client())
+    done, pending = await asyncio.wait({t_in, t_out}, return_when=asyncio.FIRST_COMPLETED)
+    for p in pending:
+        p.cancel()
     return await proc.wait()

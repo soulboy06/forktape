@@ -25,6 +25,7 @@ SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=15000;
 
 CREATE TABLE IF NOT EXISTS tapes (
     tape_id TEXT PRIMARY KEY,
@@ -125,6 +126,12 @@ class TapeStore:
         with self._lock:
             self._conn.close()
 
+    def __enter__(self) -> TapeStore:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
     # ------------------------------------------------------------------
     # Tapes CRUD
     # ------------------------------------------------------------------
@@ -170,10 +177,16 @@ class TapeStore:
         failure_reason: str | None = None,
     ) -> None:
         with self._lock:
-            self._conn.execute(
-                "UPDATE tapes SET status = ?, failure_reason = COALESCE(?, failure_reason) WHERE tape_id = ?",
-                (status.value, failure_reason, tape_id),
-            )
+            if status == TapeStatus.SUCCESS and failure_reason is None:
+                self._conn.execute(
+                    "UPDATE tapes SET status = ?, failure_reason = NULL WHERE tape_id = ?",
+                    (status.value, tape_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE tapes SET status = ?, failure_reason = COALESCE(?, failure_reason) WHERE tape_id = ?",
+                    (status.value, failure_reason, tape_id),
+                )
             self._conn.commit()
 
     def refresh_tape_Rollups(self, tape_id: str) -> TapeRecord | None:
@@ -333,6 +346,14 @@ class TapeStore:
         if row is None:
             return None
         return self._row_to_step(row)
+
+    def get_max_step_index(self, tape_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(step_index), 0) AS max_idx FROM steps WHERE tape_id = ?",
+                (tape_id,),
+            ).fetchone()
+        return int(row["max_idx"]) if row is not None else 0
 
     # ------------------------------------------------------------------
     # MCP Spans CRUD

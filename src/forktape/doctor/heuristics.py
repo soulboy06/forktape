@@ -26,6 +26,38 @@ EMPTY_PAYLOAD_MARKERS = {
 }
 
 
+def _safe_float(val: Any) -> float:
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    if isinstance(val, str):
+        m = re.search(r"-?\d+(?:\.\d+)?", val.replace(",", ""))
+        if m:
+            try:
+                return float(m.group(0))
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+def _flatten_block_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item["text"]))
+                elif "content" in item:
+                    parts.append(_flatten_block_content(item["content"]))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return json.dumps(content, ensure_ascii=False)
+
+
 def _normalize_empty_check(text: str) -> bool:
     s = text.strip().lower()
     if s in EMPTY_PAYLOAD_MARKERS:
@@ -48,18 +80,17 @@ def _extract_preceding_tool_messages(request: dict[str, Any]) -> list[str]:
     if not isinstance(msgs, list) or not msgs:
         return []
     collected: list[str] = []
-    # Walk backwards from the end collecting contiguous tool outputs from the immediately preceding turn
     for m in reversed(msgs):
         if not isinstance(m, dict):
             break
         if m.get("role") == "tool":
-            collected.append(str(m.get("content", "")))
+            collected.append(_flatten_block_content(m.get("content")))
         elif isinstance(m.get("content"), list) and any(
             isinstance(b, dict) and b.get("type") == "tool_result" for b in m["content"]
         ):
             for b in m["content"]:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    collected.append(str(b.get("content", "")))
+                    collected.append(_flatten_block_content(b.get("content")))
         else:
             break
     return collected
@@ -88,7 +119,17 @@ def _did_step_trigger_downstream_tool_error(
     if step_pos + 1 < len(steps):
         next_msgs = steps[step_pos + 1].raw_request.get("messages") or []
         tool_outs = _extract_preceding_tool_messages({"messages": next_msgs})
-        error_tokens = ("error", "invalid", "denied", "exceed", "not_found", "not found", "deprecated", "failed", "rejected")
+        error_tokens = (
+            "error",
+            "invalid",
+            "denied",
+            "exceed",
+            "not_found",
+            "not found",
+            "deprecated",
+            "failed",
+            "rejected",
+        )
         for out in tool_outs:
             out_l = out.lower()
             if any(tok in out_l for tok in error_tokens):
@@ -169,10 +210,18 @@ def scan_tape_anomalies(
         # 3. CONTEXT_MIDDLE_LOSS: Oversized raw tool JSON/HTML in context window polluting attention
         bloated_turns: list[tuple[int, int]] = []
         for m_i, m in enumerate(msgs):
-            if isinstance(m, dict) and m.get("role") == "tool":
-                c_len = len(str(m.get("content", "")))
-                if c_len >= 5000 and "_forktape_compacted" not in str(m.get("content", "")):
-                    bloated_turns.append((m_i, c_len))
+            if not isinstance(m, dict):
+                continue
+            if m.get("role") == "tool":
+                c_text = _flatten_block_content(m.get("content"))
+                if len(c_text) >= 5000 and "_forktape_compacted" not in c_text:
+                    bloated_turns.append((m_i, len(c_text)))
+            elif isinstance(m.get("content"), list):
+                for b in m["content"]:
+                    if isinstance(b, dict) and b.get("type") == "tool_result":
+                        c_text = _flatten_block_content(b.get("content"))
+                        if len(c_text) >= 5000 and "_forktape_compacted" not in c_text:
+                            bloated_turns.append((m_i, len(c_text)))
         if bloated_turns:
             max_chars = max(c for _, c in bloated_turns)
             violated_constraint = (
@@ -182,7 +231,7 @@ def scan_tape_anomalies(
                         tc.arguments.get("exceeds_policy") is True
                         or tc.arguments.get("override_cap") is True
                         or "uncompacted" in str(tc.arguments)
-                        or float(tc.arguments.get("amount", 0) or 0) > 500
+                        or _safe_float(tc.arguments.get("amount")) > 500
                     )
                     for tc in step.tool_calls
                 )
@@ -283,13 +332,11 @@ def locate_suspected_drift_step(
     if not findings:
         return steps[-1].step_index, "PROMPT_AMBIGUITY"
 
-    # Score each (step_index, code); prefer critical direct-failure triggers first, and earliest onset for loops
     step_scores: dict[int, float] = {}
     step_top_code: dict[int, tuple[float, str]] = {}
 
     for f in findings:
         w = SEVERITY_WEIGHTS.get(f.severity, 1.0)
-        # Boost direct behavioral failure triggers over background warnings
         if f.code == "SILENT_EMPTY_RETRIEVAL":
             w += 6.0
         elif f.code == "TOOL_SCHEMA_OVERLOAD" and f.evidence.get("called_distractor"):
@@ -297,7 +344,6 @@ def locate_suspected_drift_step(
         elif f.code == "CONTEXT_MIDDLE_LOSS" and f.evidence.get("violated_constraint"):
             w += 6.2
         elif f.code == "TOOL_CALL_LOOP":
-            # Attribute loop onset to the first repeated step
             repeat_steps = f.evidence.get("steps") or [f.step_index]
             target_idx = repeat_steps[1] if len(repeat_steps) >= 2 else f.step_index
             step_scores[target_idx] = step_scores.get(target_idx, 0.0) + w + 4.0
@@ -311,7 +357,6 @@ def locate_suspected_drift_step(
         if w > prev_best[0]:
             step_top_code[f.step_index] = (w, f.code)
 
-    # Pick highest-scoring step; break ties by earliest step index (root cause precedes downstream cascade)
     best_step = sorted(step_scores.keys(), key=lambda s: (-step_scores[s], s))[0]
     best_code = step_top_code[best_step][1]
     return best_step, best_code
