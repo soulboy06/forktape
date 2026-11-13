@@ -1,0 +1,35 @@
+{
+  "benchmark": "ForkBench-50",
+  "total_trajectories": 50,
+  "categories": [
+    "TOOL_SCHEMA_OVERLOAD",
+    "CONTEXT_MIDDLE_LOSS",
+    "SILENT_EMPTY_RETRIEVAL",
+    "PREFIX_CACHE_THRASHING",
+    "TOOL_CALL_LOOP"
+  ],
+  "baseline_naive_tail_inspector": {
+    "drift_step_exact_acc_pct": 0.0,
+    "root_cause_classification_acc_pct": 22.0
+  },
+  "forktape_counterfactual_biopsy": {
+    "drift_step_exact_acc_pct": 96.0,
+    "drift_step_within_1_acc_pct": 96.0,
+    "root_cause_classification_acc_pct": 96.0,
+    "empirical_fix_verification_rate_pct": 100.0,
+    "per_category_accuracy": {
+      "TOOL_SCHEMA_OVERLOAD": "11/11 (100%)",
+      "CONTEXT_MIDDLE_LOSS": "8/10 (80%)",
+      "SILENT_EMPTY_RETRIEVAL": "10/10 (100%)",
+      "PREFIX_CACHE_THRASHING": "9/9 (100%)",
+      "TOOL_CALL_LOOP": "10/10 (100%)"
+    }
+  },
+  "debugging_efficiency_gains": {
+    "avg_token_cost_reduction_pct": 89.41,
+    "iteration_speedup_factor_x": 53.7,
+    "full_rerun_tokens_total": 374706,
+    "forktape_targeted_tokens_total": 39687
+  },
+  "benchmark_wall_time_sec": 0.85
+}

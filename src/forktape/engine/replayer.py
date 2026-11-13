@@ -235,21 +235,23 @@ class SmartOfflineStepExecutor:
             str(m.get("content", "")) for m in messages if isinstance(m, dict) and m.get("role") == "tool"
         )
 
-        # Detect if bloated uncompacted context exists (>10,000 chars of raw tool output)
+        # Detect if bloated uncompacted context exists (>5,000 chars of raw tool output)
         has_context_bloat = any(
             isinstance(m, dict)
             and m.get("role") == "tool"
-            and len(str(m.get("content", ""))) > 6000
+            and len(str(m.get("content", ""))) >= 5000
             and "_forktape_compacted" not in str(m.get("content", ""))
-            for m in messages[:-1]
+            for m in messages
         )
 
         # Detect if empty retrieval occurred in immediately preceding tool message
+        from forktape.doctor.heuristics import _normalize_empty_check
+
         last_msg = messages[-1] if messages else {}
         last_tool_empty = (
             isinstance(last_msg, dict)
             and last_msg.get("role") == "tool"
-            and str(last_msg.get("content", "")).strip() in ("[]", "{}", "null", '{"results": []}', "No results found")
+            and _normalize_empty_check(str(last_msg.get("content", "")))
         )
         has_grounding_guard = (
             "never fabricate" in sys_text.lower()

@@ -65,6 +65,7 @@ Issues = "https://github.com/soulboy06/forktape/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/forktape"]
+artifacts = ["src/forktape/static_ui/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

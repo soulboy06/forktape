@@ -72,20 +72,45 @@ def _collect_grounded_corpus_before_step(request: dict[str, Any]) -> str:
     return " ".join(json.dumps(m, ensure_ascii=False) for m in msgs)
 
 
+def _did_step_trigger_downstream_tool_error(
+    step_pos: int,
+    steps: list[TapeStep],
+    mcp_spans: list[MCPSpan] | None,
+) -> bool:
+    """Forward Causal Consequence Check: inspect whether Step `k`'s tool call returned an error
+    in Step `k+1`'s incoming tool messages or MCP spans (domain-agnostic!).
+    """
+    curr = steps[step_pos]
+    if mcp_spans:
+        for sp in mcp_spans:
+            if sp.step_index == curr.step_index and sp.is_error:
+                return True
+    if step_pos + 1 < len(steps):
+        next_msgs = steps[step_pos + 1].raw_request.get("messages") or []
+        tool_outs = _extract_preceding_tool_messages({"messages": next_msgs})
+        error_tokens = ("error", "invalid", "denied", "exceed", "not_found", "not found", "deprecated", "failed", "rejected")
+        for out in tool_outs:
+            out_l = out.lower()
+            if any(tok in out_l for tok in error_tokens):
+                return True
+    return step_pos == len(steps) - 1 and len(curr.tool_calls) > 0
+
+
 def scan_tape_anomalies(
     tape: TapeRecord,
     steps: list[TapeStep],
     mcp_spans: list[MCPSpan] | None = None,
 ) -> list[AnomalyFlag]:
-    """Scan an agent trajectory for 5 canonical engineering failure modes."""
+    """Scan an agent trajectory for 5 canonical engineering failure modes + forward causal errors."""
     findings: list[AnomalyFlag] = []
     seen_call_signatures: dict[str, list[int]] = {}
 
-    for step in steps:
+    for pos, step in enumerate(steps):
         idx = step.step_index
         req = step.raw_request
         tools_list = req.get("tools") if isinstance(req.get("tools"), list) else []
         msgs = req.get("messages") if isinstance(req.get("messages"), list) else []
+        caused_downstream_error = _did_step_trigger_downstream_tool_error(pos, steps, mcp_spans)
 
         # 1. TOOL_CALL_LOOP: Repeated identical (tool_name, canonical_args) calls
         for tc in step.tool_calls:
@@ -107,7 +132,7 @@ def scan_tape_anomalies(
                     )
                 )
 
-        # 2. TOOL_SCHEMA_OVERLOAD: Massive MCP/function schema dilution (>= 20 tools or >= 2500 schema tokens)
+        # 2. TOOL_SCHEMA_OVERLOAD: Massive MCP/function schema dilution (>= 20 tools or >= 2400 schema tokens)
         tool_count = len(tools_list)
         schema_tokens = step.token_breakdown.tools_schema_tokens
         called_distractor = any(
@@ -118,10 +143,10 @@ def scan_tape_anomalies(
             or (isinstance(tc.arguments, dict) and "warning" in tc.arguments)
             for tc in step.tool_calls
         )
-        if (tool_count >= 20 or schema_tokens >= 2400) and (called_distractor or step.tool_calls):
-            severity = "critical" if called_distractor else "medium"
-            # Only flag prominently when distractor/wrong selection happens or on heaviest overloaded step
-            if called_distractor or tool_count >= 25:
+        if (tool_count >= 20 or schema_tokens >= 2400) and step.tool_calls:
+            triggered_fault = called_distractor or caused_downstream_error
+            severity = "critical" if triggered_fault else "medium"
+            if triggered_fault or tool_count >= 25:
                 findings.append(
                     AnomalyFlag(
                         code="TOOL_SCHEMA_OVERLOAD",
@@ -136,31 +161,33 @@ def scan_tape_anomalies(
                             "tool_count": tool_count,
                             "tools_schema_tokens": schema_tokens,
                             "called_tools": [tc.name for tc in step.tool_calls],
-                            "called_distractor": called_distractor,
+                            "called_distractor": triggered_fault,
                         },
                     )
                 )
 
-        # 3. CONTEXT_MIDDLE_LOSS: Oversized raw tool JSON/HTML in earlier/middle turns polluting attention
+        # 3. CONTEXT_MIDDLE_LOSS: Oversized raw tool JSON/HTML in context window polluting attention
         bloated_turns: list[tuple[int, int]] = []
-        for m_i, m in enumerate(msgs[:-1]):
+        for m_i, m in enumerate(msgs):
             if isinstance(m, dict) and m.get("role") == "tool":
                 c_len = len(str(m.get("content", "")))
                 if c_len >= 5000 and "_forktape_compacted" not in str(m.get("content", "")):
                     bloated_turns.append((m_i, c_len))
         if bloated_turns:
             max_chars = max(c for _, c in bloated_turns)
-            # Check if constraint violation or wrong parameter occurred in this step
-            violated_constraint = any(
-                isinstance(tc.arguments, dict)
-                and (
-                    tc.arguments.get("exceeds_policy") is True
-                    or tc.arguments.get("override_cap") is True
-                    or "uncompacted" in str(tc.arguments)
-                    or float(tc.arguments.get("amount", 0) or 0) > 500
+            violated_constraint = (
+                any(
+                    isinstance(tc.arguments, dict)
+                    and (
+                        tc.arguments.get("exceeds_policy") is True
+                        or tc.arguments.get("override_cap") is True
+                        or "uncompacted" in str(tc.arguments)
+                        or float(tc.arguments.get("amount", 0) or 0) > 500
+                    )
+                    for tc in step.tool_calls
                 )
-                for tc in step.tool_calls
-            ) or ("violat" in (tape.failure_reason or "").lower() and idx == len(steps))
+                or caused_downstream_error
+            )
             findings.append(
                 AnomalyFlag(
                     code="CONTEXT_MIDDLE_LOSS",
@@ -168,7 +195,7 @@ def scan_tape_anomalies(
                     step_index=idx,
                     title=f"Context Rot / Middle Loss ({max_chars:,} chars raw tool bloat)",
                     detail=(
-                        f"Uncompacted tool payload ({max_chars:,} chars) in middle history buried "
+                        f"Uncompacted tool payload ({max_chars:,} chars) in context window buried "
                         "earlier policy constraints during step reasoning."
                     ),
                     evidence={

@@ -197,10 +197,10 @@ def apply_override_patch(request: dict[str, Any], patch: OverridePatch | None) -
             required_tool_names=historically_used,
         )
 
-    # 4. Middle-Context Tool Output Compaction (preserves the latest turn intact, compacts older bloat)
-    if patch.compact_context_max_chars is not None and isinstance(messages, list) and len(messages) > 2:
+    # 4. Context Tool Output Compaction (compacts any oversized tool payload > max_chars)
+    if patch.compact_context_max_chars is not None and isinstance(messages, list):
         max_c = patch.compact_context_max_chars
-        for m in messages[:-1]:
+        for m in messages:
             if not isinstance(m, dict):
                 continue
             if m.get("role") == "tool" and isinstance(m.get("content"), str):
