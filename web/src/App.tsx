@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -119,9 +119,10 @@ export default function App() {
   const t = UI_TEXT[lang];
 
   const [mobileVaultOpen, setMobileVaultOpen] = useState(false);
-  const [mobilePane, setMobilePane] = useState<MobilePane>("workbench");
+  const [mobilePane, setMobilePane] = useState<MobilePane>("timeline");
 
   const [tapes, setTapes] = useState<TapeRecord[]>([]);
+  const [tapesLoading, setTapesLoading] = useState<boolean>(true);
   const [filterMode, setFilterMode] = useState<"all" | "roots" | "failed">("roots");
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTapeId, setSelectedTapeId] = useState<string | null>(null);
@@ -131,6 +132,11 @@ export default function App() {
   const [loading, setLoading] = useState<boolean>(false);
   const [runningAction, setRunningAction] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [rawStepCache, setRawStepCache] = useState<Record<string, TapeStep>>({});
+  const [loadingRawStep, setLoadingRawStep] = useState<boolean>(false);
+
+  const detailAbortRef = useRef<AbortController | null>(null);
+  const timelineScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Fork Studio controls
   const [forkLabel, setForkLabel] = useState("Studio Counterfactual Fork");
@@ -167,8 +173,10 @@ export default function App() {
   };
 
   const loadTapes = async (preserveSelection = true) => {
+    setTapesLoading(true);
     try {
       const resp = await fetch("/api/tapes?limit=200");
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data = await resp.json();
       const list: TapeRecord[] = data.tapes || [];
       setTapes(list);
@@ -180,28 +188,42 @@ export default function App() {
       }
     } catch (err) {
       setErrorBanner(`API Error: ${String(err)}`);
+    } finally {
+      setTapesLoading(false);
     }
   };
 
-  const fetchDiff = async (leftId: string, rightId: string) => {
+  const fetchDiff = async (leftId: string, rightId: string, signal?: AbortSignal) => {
     try {
-      const resp = await fetch(`/api/tapes/${leftId}/diff/${rightId}`);
-      if (resp.ok) {
+      const resp = await fetch(
+        `/api/tapes/${encodeURIComponent(leftId)}/diff/${encodeURIComponent(rightId)}`,
+        signal ? { signal } : undefined
+      );
+      if (resp.ok && !signal?.aborted) {
         setComparison(await resp.json());
       }
     } catch {
-      // ignore transient diff errors
+      // ignore transient or aborted diff errors
     }
   };
 
   const loadTapeDetail = async (tapeId: string) => {
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
+    const { signal } = controller;
+
     setLoading(true);
     setErrorBanner(null);
     try {
-      const resp = await fetch(`/api/tapes/${tapeId}`);
+      const resp = await fetch(`/api/tapes/${encodeURIComponent(tapeId)}?slim=true`, { signal });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const d: TapeDetailResponse = await resp.json();
+      if (signal.aborted) return;
+
       setDetail(d);
+      setLoading(false);
+      timelineScrollRef.current?.scrollTo({ top: 0 });
 
       const driftStep =
         d.biopsy_report?.suspected_drift_step ||
@@ -224,30 +246,39 @@ export default function App() {
       if (d.biopsy_report?.generated_pytest_code) {
         setPytestCode(d.biopsy_report.generated_pytest_code);
       } else {
-        const pyResp = await fetch(`/api/tapes/${tapeId}/export-pytest`);
-        if (pyResp.ok) {
-          const pyData = await pyResp.json();
-          setPytestCode(pyData.pytest_code || "");
-        }
+        setPytestCode("");
+        void fetch(`/api/tapes/${encodeURIComponent(tapeId)}/export-pytest`, { signal })
+          .then(async (pyResp) => {
+            if (pyResp.ok && !signal.aborted) {
+              const pyData = await pyResp.json();
+              if (!signal.aborted) setPytestCode(pyData.pytest_code || "");
+            }
+          })
+          .catch(() => {});
       }
 
       if (d.tape.parent_tape_id) {
         setCompareTargetId(d.tape.parent_tape_id);
-        await fetchDiff(d.tape.parent_tape_id, d.tape.tape_id);
+        void fetchDiff(d.tape.parent_tape_id, d.tape.tape_id, signal);
       } else if (d.children.length > 0) {
         const provenBranchId =
           d.biopsy_report?.ablation_runs.find((r) => r.resolved_failure)?.forked_tape_id ||
           d.children[0].tape_id;
         setCompareTargetId(provenBranchId);
-        await fetchDiff(d.tape.tape_id, provenBranchId);
+        void fetchDiff(d.tape.tape_id, provenBranchId, signal);
       } else {
         setComparison(null);
         setCompareTargetId("");
       }
     } catch (err) {
+      if ((err as Error)?.name === "AbortError" || signal.aborted) {
+        return;
+      }
       setErrorBanner(`${tapeId}: ${String(err)}`);
     } finally {
-      setLoading(false);
+      if (detailAbortRef.current === controller) {
+        setLoading(false);
+      }
     }
   };
 
@@ -265,6 +296,40 @@ export default function App() {
     if (!detail) return undefined;
     return detail.steps.find((s) => s.step_index === selectedStepIdx) || detail.steps[0];
   }, [detail, selectedStepIdx]);
+
+  const selectedStepCacheKey =
+    detail && selectedStep ? `${detail.tape.tape_id}:${selectedStep.step_index}` : "";
+
+  useEffect(() => {
+    if (activeTab !== "xray" || !detail || !selectedStep) return;
+    const hasInlineRaw =
+      Object.keys(selectedStep.raw_request || {}).length > 0 ||
+      Object.keys(selectedStep.raw_response || {}).length > 0;
+    if (hasInlineRaw || rawStepCache[selectedStepCacheKey]) return;
+
+    const ctrl = new AbortController();
+    setLoadingRawStep(true);
+    void fetch(
+      `/api/tapes/${encodeURIComponent(detail.tape.tape_id)}/steps/${selectedStep.step_index}`,
+      { signal: ctrl.signal }
+    )
+      .then(async (r) => {
+        if (!r.ok) return;
+        const payload = await r.json();
+        if (!ctrl.signal.aborted && payload.step) {
+          setRawStepCache((prev) => ({ ...prev, [selectedStepCacheKey]: payload.step }));
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!ctrl.signal.aborted) setLoadingRawStep(false);
+      });
+
+    return () => ctrl.abort();
+  }, [activeTab, detail, selectedStep, selectedStepCacheKey, rawStepCache]);
+
+  const xrayStep: TapeStep | undefined =
+    (selectedStepCacheKey ? rawStepCache[selectedStepCacheKey] : undefined) || selectedStep;
 
   const childrenMap = useMemo(() => {
     const map: Record<string, TapeRecord[]> = {};
@@ -296,8 +361,16 @@ export default function App() {
   }, [tapes, filterMode, searchQuery]);
 
   const handleSelectTape = (id: string) => {
-    setSelectedTapeId(id);
     setMobileVaultOpen(false);
+    setMobilePane("timeline");
+    if (typeof window !== "undefined") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+    if (id === selectedTapeId) {
+      void loadTapeDetail(id);
+    } else {
+      setSelectedTapeId(id);
+    }
   };
 
   const handleRunDoctor = async () => {
@@ -380,12 +453,14 @@ export default function App() {
 
   const rootCount = useMemo(() => tapes.filter((item) => !item.parent_tape_id).length, [tapes]);
 
-  const renderVaultContent = () => (
+  const renderVaultContent = (searchInputId: string) => (
     <>
       <div className="p-3.5 border-b border-white/[0.06] space-y-2.5">
         <div className="relative">
           <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-3 top-1/2 -translate-y-1/2" />
           <input
+            id={searchInputId}
+            name={searchInputId}
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
@@ -589,7 +664,7 @@ export default function App() {
                 <X className="w-4 h-4" />
               </button>
             </div>
-            {renderVaultContent()}
+            {renderVaultContent("mobile-vault-search")}
           </aside>
         </div>
       )}
@@ -610,7 +685,7 @@ export default function App() {
       <div className="flex-1 flex min-h-0">
         {/* Desktop Sidebar */}
         <aside className="hidden lg:flex w-76 xl:w-82 shrink-0 border-r border-white/[0.07] bg-[#0c0c0f] flex-col min-h-0">
-          {renderVaultContent()}
+          {renderVaultContent("desktop-vault-search")}
         </aside>
 
         {/* Center + Right Workspace */}
@@ -622,6 +697,12 @@ export default function App() {
                 <div className="min-w-0 flex-1 space-y-1.5">
                   <div className="flex items-center gap-2 flex-wrap">
                     <StatusPill status={detail.tape.status} lang={lang} />
+                    {loading && (
+                      <span className="inline-flex items-center gap-1 text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-full animate-pulse">
+                        <RefreshCw className="w-3 h-3 animate-spin" />
+                        {t.loadingTelemetry}
+                      </span>
+                    )}
                     {detail.tape.parent_tape_id && (
                       <button
                         onClick={() => handleSelectTape(detail.tape.parent_tape_id!)}
@@ -777,7 +858,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex-1 lg:overflow-y-auto p-3.5 space-y-2.5">
+                <div ref={timelineScrollRef} className="flex-1 lg:overflow-y-auto p-3.5 space-y-2.5">
                   {detail.steps.map((step) => {
                     const isSelected = step.step_index === selectedStepIdx;
                     const isDrift =
@@ -825,7 +906,7 @@ export default function App() {
                             )}
                           </div>
 
-                          <div className="flex items-center gap-2 shrink-0">
+                          <div className="flex items-center gap-1.5 shrink-0">
                             <span
                               className={`text-[11px] font-mono tabular-nums ${
                                 step.prefix_cache_ratio >= 0.85
@@ -840,9 +921,20 @@ export default function App() {
                               onClick={(e) => {
                                 e.stopPropagation();
                                 setSelectedStepIdx(step.step_index);
+                                openWorkbenchTab("xray");
+                              }}
+                              className="lg:hidden text-[11px] font-medium text-zinc-400 hover:text-zinc-100 bg-white/[0.04] px-2 py-0.5 rounded-md"
+                            >
+                              {t.jumpXray}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedStepIdx(step.step_index);
                                 openWorkbenchTab("fork");
                               }}
-                              className="lg:hidden text-[11px] font-medium text-zinc-300 bg-white/[0.06] px-2 py-0.5 rounded-md"
+                              className="lg:hidden text-[11px] font-medium text-zinc-200 bg-white/[0.08] px-2 py-0.5 rounded-md"
                             >
                               {t.jumpFork}
                             </button>
@@ -1410,15 +1502,22 @@ export default function App() {
                   )}
 
                   {/* TAB 4: STEP PAYLOAD & PREFIX KV CACHE X-RAY */}
-                  {activeTab === "xray" && selectedStep && (
+                  {activeTab === "xray" && xrayStep && (
                     <div className="space-y-3.5 text-xs">
-                      {selectedStep.prefix_break_snippet && (
+                      {loadingRawStep && (
+                        <div className="rounded-xl border border-white/[0.08] bg-zinc-900/60 px-3.5 py-2.5 text-xs text-zinc-400 flex items-center gap-2">
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-zinc-300" />
+                          <span>{t.loadingRawPayload}</span>
+                        </div>
+                      )}
+
+                      {xrayStep.prefix_break_snippet && (
                         <div className="rounded-xl border border-rose-500/30 bg-rose-500/[0.06] p-3.5 space-y-1.5">
                           <div className="font-semibold text-rose-300">
-                            {t.cacheBreakTitle(selectedStep.prefix_break_offset)}
+                            {t.cacheBreakTitle(xrayStep.prefix_break_offset)}
                           </div>
                           <div className="font-mono text-[11px] text-rose-200/90 break-all">
-                            {selectedStep.prefix_break_snippet}
+                            {xrayStep.prefix_break_snippet}
                           </div>
                         </div>
                       )}
@@ -1426,38 +1525,38 @@ export default function App() {
                       <div className="rounded-xl border border-white/[0.07] bg-zinc-900/40 p-3.5 space-y-1">
                         <div className="text-[11px] text-zinc-500">{t.fingerprintTitle}</div>
                         <div className="font-mono text-xs text-zinc-200 break-all">
-                          {selectedStep.canonical_hash}
+                          {xrayStep.canonical_hash}
                         </div>
                       </div>
 
                       <div className="rounded-xl border border-white/[0.07] bg-zinc-900/40 p-3.5 space-y-2">
                         <div className="text-[11px] text-zinc-500">{t.rawReqTitle}</div>
                         <pre className="text-[11px] font-mono text-zinc-300 overflow-x-auto max-h-96 leading-relaxed">
-                          {JSON.stringify(selectedStep.raw_request, null, 2)}
+                          {JSON.stringify(xrayStep.raw_request, null, 2)}
                         </pre>
                       </div>
 
-                      {selectedStep.reasoning_text && (
+                      {xrayStep.reasoning_text && (
                         <div className="rounded-xl border border-violet-500/25 bg-violet-500/[0.05] p-3.5 space-y-1.5">
                           <div className="text-[11px] text-violet-300 font-medium">
                             {t.reasoningTitle}
                           </div>
                           <pre className="text-[11px] font-mono text-violet-100 whitespace-pre-wrap leading-relaxed">
-                            {selectedStep.reasoning_text}
+                            {xrayStep.reasoning_text}
                           </pre>
                         </div>
                       )}
 
-                      {detail.mcp_spans.filter((sp) => sp.step_index === selectedStep.step_index)
+                      {detail.mcp_spans.filter((sp) => sp.step_index === xrayStep.step_index)
                         .length > 0 && (
                         <div className="rounded-xl border border-emerald-500/25 bg-emerald-500/[0.04] p-3.5 space-y-2">
                           <div className="text-[11px] text-emerald-300 font-medium">
-                            {t.mcpSpansTitle(selectedStep.step_index)}
+                            {t.mcpSpansTitle(xrayStep.step_index)}
                           </div>
                           <pre className="text-[11px] font-mono text-emerald-200/90 overflow-x-auto max-h-64 leading-relaxed">
                             {JSON.stringify(
                               detail.mcp_spans.filter(
-                                (sp) => sp.step_index === selectedStep.step_index
+                                (sp) => sp.step_index === xrayStep.step_index
                               ),
                               null,
                               2
@@ -1469,7 +1568,7 @@ export default function App() {
                       <div className="rounded-xl border border-white/[0.07] bg-zinc-900/40 p-3.5 space-y-2">
                         <div className="text-[11px] text-zinc-500">{t.rawRespTitle}</div>
                         <pre className="text-[11px] font-mono text-zinc-300 overflow-x-auto max-h-96 leading-relaxed">
-                          {JSON.stringify(selectedStep.raw_response, null, 2)}
+                          {JSON.stringify(xrayStep.raw_response, null, 2)}
                         </pre>
                       </div>
                     </div>
@@ -1506,13 +1605,25 @@ export default function App() {
           </main>
         ) : (
           <div className="flex-1 flex flex-col items-center justify-center p-8 text-center gap-3 text-sm text-zinc-500">
-            <span>{t.emptyVaultHint}</span>
-            <button
-              onClick={() => setMobileVaultOpen(true)}
-              className="lg:hidden inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-zinc-100 text-zinc-950 text-xs font-semibold"
-            >
-              {t.vaultBtn} <ChevronRight className="w-3.5 h-3.5" />
-            </button>
+            {loading || tapesLoading ? (
+              <>
+                <RefreshCw className="w-5 h-5 text-zinc-300 animate-spin" />
+                <span className="text-zinc-300 text-xs font-medium">{t.loadingTelemetry}</span>
+                {selectedTapeId && (
+                  <span className="font-mono text-[11px] text-zinc-500">{selectedTapeId}</span>
+                )}
+              </>
+            ) : (
+              <>
+                <span>{t.emptyVaultHint}</span>
+                <button
+                  onClick={() => setMobileVaultOpen(true)}
+                  className="lg:hidden inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-zinc-100 text-zinc-950 text-xs font-semibold"
+                >
+                  {t.vaultBtn} <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>

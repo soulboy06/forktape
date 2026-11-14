@@ -543,6 +543,9 @@ async def test_web_studio_spa_and_full_rest_api_e2e(tmp_path: Path) -> None:
             assert js_match is not None and css_match is not None
             assert (await client.get(js_match.group(1))).status_code == 200
             assert (await client.get(css_match.group(1))).status_code == 200
+            fav_resp = await client.get("/favicon.ico")
+            assert fav_resp.status_code == 200
+            assert "image/svg+xml" in fav_resp.headers["content-type"]
 
             # 2. Health & Tapes list
             health = (await client.get("/api/health")).json()
@@ -552,11 +555,31 @@ async def test_web_studio_spa_and_full_rest_api_e2e(tmp_path: Path) -> None:
             tapes = (await client.get("/api/tapes")).json()["tapes"]
             assert len(tapes) >= 4
 
-            # 3. Tape detail
-            detail = (await client.get("/api/tapes/tape_demo_mcp_overload")).json()
+            # 3. Tape detail (full + ?slim=true + GZip compression + lazy per-step raw endpoint)
+            detail_resp = await client.get(
+                "/api/tapes/tape_demo_mcp_overload", headers={"Accept-Encoding": "gzip"}
+            )
+            assert detail_resp.headers.get("content-encoding") == "gzip"
+            detail = detail_resp.json()
             assert detail["tape"]["tape_id"] == "tape_demo_mcp_overload"
             assert len(detail["steps"]) == 5
+            assert detail["steps"][0]["raw_request"] != {}
             assert len(detail["heuristic_findings"]) >= 1
+
+            slim_detail = (
+                await client.get("/api/tapes/tape_demo_mcp_overload?slim=true")
+            ).json()
+            assert len(slim_detail["steps"]) == 5
+            assert slim_detail["steps"][0]["raw_request"] == {}
+            assert slim_detail["steps"][0]["raw_response"] == {}
+            assert slim_detail["steps"][4]["tool_calls"][0]["name"] != ""
+
+            raw_step5 = await client.get("/api/tapes/tape_demo_mcp_overload/steps/5")
+            assert raw_step5.status_code == 200
+            assert raw_step5.json()["step"]["raw_request"]["messages"]
+            assert (
+                await client.get("/api/tapes/tape_demo_mcp_overload/steps/999")
+            ).status_code == 404
 
             # 4. Step validation (step_index=0 -> 400) & valid Time-Travel Fork
             bad_fork = await client.post(

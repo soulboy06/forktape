@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -160,6 +161,7 @@ def create_app(
         version=__version__,
         description="Deterministic time-travel forking and counterfactual biopsy for AI Agents.",
     )
+    app.add_middleware(GZipMiddleware, minimum_size=500)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -699,7 +701,10 @@ def create_app(
         return {"tapes": items}
 
     @app.get("/api/tapes/{tape_id}")
-    async def api_get_tape_detail(tape_id: str) -> dict[str, Any]:
+    async def api_get_tape_detail(
+        tape_id: str,
+        slim: bool = Query(default=False, description="Omit heavy raw_request/raw_response payloads for fast timeline rendering"),
+    ) -> dict[str, Any]:
         tape = tape_store.get_tape(tape_id)
         if tape is None:
             raise HTTPException(status_code=404, detail=f"Tape '{tape_id}' not found")
@@ -719,14 +724,29 @@ def create_app(
         tape_dict["total_tokens"] = tape.total_tokens
         tape_dict["cache_hit_rate"] = tape.cache_hit_rate
 
+        serialized_steps: list[dict[str, Any]] = []
+        for s in steps:
+            sd = s.model_dump()
+            if slim:
+                sd["raw_request"] = {}
+                sd["raw_response"] = {}
+            serialized_steps.append(sd)
+
         return {
             "tape": tape_dict,
-            "steps": [s.model_dump() for s in steps],
+            "steps": serialized_steps,
             "mcp_spans": [sp.model_dump() for sp in mcp_spans],
             "children": [c.model_dump() for c in children],
             "heuristic_findings": [f.model_dump() for f in findings],
             "biopsy_report": report.model_dump() if report else None,
         }
+
+    @app.get("/api/tapes/{tape_id}/steps/{step_index}")
+    async def api_get_single_step_raw(tape_id: str, step_index: int) -> dict[str, Any]:
+        step = tape_store.get_step(tape_id, step_index)
+        if step is None:
+            raise HTTPException(status_code=404, detail=f"Step {step_index} not found in tape '{tape_id}'")
+        return {"step": step.model_dump()}
 
     @app.delete("/api/tapes/{tape_id}")
     async def api_delete_tape(tape_id: str) -> dict[str, Any]:
@@ -852,6 +872,17 @@ def create_app(
         assets_dir = static_dir / "assets"
         if assets_dir.exists():
             app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="studio_assets")
+
+        @app.get("/favicon.ico", include_in_schema=False)
+        async def serve_favicon() -> Response:
+            svg = (
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+                '<rect width="32" height="32" rx="8" fill="#18181b"/>'
+                '<path d="M10 8v16M22 8v6a4 4 0 0 1-4 4h-8" stroke="#fafafa" stroke-width="2.6" fill="none" stroke-linecap="round"/>'
+                '<circle cx="10" cy="8" r="2.5" fill="#34d399"/><circle cx="22" cy="8" r="2.5" fill="#fbbf24"/>'
+                "</svg>"
+            )
+            return Response(content=svg, media_type="image/svg+xml")
 
         @app.get("/", include_in_schema=False)
         async def serve_studio_index() -> FileResponse:
