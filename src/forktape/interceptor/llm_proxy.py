@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import codecs
+import copy
+import os
 import re
 import time
 from collections.abc import AsyncIterator
@@ -61,6 +64,10 @@ class StandaloneForkPayload(BaseModel):
     prefer_live_upstream: bool = False
 
 
+class DoctorRunPayload(BaseModel):
+    prefer_live_upstream: bool = False
+
+
 def _validate_http_url(url: str, header_name: str) -> str:
     trimmed = url.strip()
     if not (trimmed.startswith("http://") or trimmed.startswith("https://")):
@@ -79,6 +86,63 @@ def _forward_upstream_headers(request: Request) -> dict[str, str]:
             forwarded[k] = v
     forwarded["Content-Type"] = "application/json"
     return forwarded
+
+
+async def _open_stream_with_retry(
+    target_url: str,
+    json_body: dict[str, Any],
+    headers: dict[str, str],
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    """Open an upstream SSE stream with transient TLS/TCP handshake retry on remote endpoints."""
+    is_local = "127.0.0.1" in target_url or "localhost" in target_url
+    max_attempts = 1 if is_local else 3
+    for attempt in range(1, max_attempts + 1):
+        client = httpx.AsyncClient(timeout=120.0)
+        req = client.build_request("POST", target_url, json=json_body, headers=headers)
+        try:
+            resp = await client.send(req, stream=True)
+            if not is_local and resp.status_code in (502, 503, 504) and attempt < max_attempts:
+                await resp.aclose()
+                await client.aclose()
+                await asyncio.sleep(0.5 * attempt)
+                continue
+            return client, resp
+        except httpx.TransportError as exc:
+            await client.aclose()
+            if attempt < max_attempts:
+                await asyncio.sleep(0.5 * attempt)
+            else:
+                raise HTTPException(status_code=502, detail=f"Upstream connection error: {exc}") from exc
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"Upstream connection error: {exc}") from exc
+    raise HTTPException(status_code=502, detail="Upstream connection exhausted retries")
+
+
+async def _post_json_with_retry(
+    target_url: str,
+    json_body: dict[str, Any],
+    headers: dict[str, str],
+) -> httpx.Response:
+    """Send a non-streaming upstream POST with transient TLS/TCP retry on remote endpoints."""
+    is_local = "127.0.0.1" in target_url or "localhost" in target_url
+    max_attempts = 1 if is_local else 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(target_url, json=json_body, headers=headers)
+                if not is_local and resp.status_code in (502, 503, 504) and attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                return resp
+        except httpx.TransportError as exc:
+            if attempt < max_attempts:
+                await asyncio.sleep(0.5 * attempt)
+            else:
+                raise HTTPException(status_code=502, detail=f"Upstream connection error: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Upstream connection error: {exc}") from exc
+    raise HTTPException(status_code=502, detail="Upstream connection exhausted retries")
 
 
 def create_app(
@@ -165,22 +229,82 @@ def create_app(
             outbound_body = apply_override_patch(body, applied_patch)
 
         upstream_override = request.headers.get("x-forktape-upstream")
+        model_lower = str(outbound_body.get("model") or "").lower()
         if upstream_override:
             upstream_base = _validate_http_url(upstream_override, "X-ForkTape-Upstream").rstrip("/")
         else:
             upstream_base = cfg.openai_upstream.rstrip("/")
+            if model_lower.startswith("deepseek") and upstream_base == "https://api.openai.com/v1":
+                upstream_base = "https://api.deepseek.com/v1"
         target_url = f"{upstream_base}/chat/completions"
         up_headers = _forward_upstream_headers(request)
+        existing_auth = next((v for k, v in up_headers.items() if k.lower() == "authorization"), "")
+        if not existing_auth or existing_auth.strip() in (
+            "Bearer dummy",
+            "Bearer forktape",
+            "Bearer forktape-local",
+        ):
+            env_key = (
+                os.environ.get("DEEPSEEK_API_KEY", "")
+                if ("deepseek" in upstream_base or model_lower.startswith("deepseek"))
+                else ""
+            ) or os.environ.get("OPENAI_API_KEY", "")
+            if env_key:
+                for k in list(up_headers.keys()):
+                    if k.lower() == "authorization":
+                        up_headers.pop(k, None)
+                up_headers["Authorization"] = f"Bearer {env_key}"
+
+        # Auto-heal missing `reasoning_content` on multi-turn DeepSeek V4.1 / Reasoner tool-call threads
+        # when OpenAI-SDK clients strip `reasoning_content` between turns.
+        if "deepseek" in upstream_base or model_lower.startswith("deepseek"):
+            raw_msgs = outbound_body.get("messages")
+            needs_reasoning_heal = False
+            if isinstance(raw_msgs, list):
+                for m_idx, m in enumerate(raw_msgs):
+                    if not isinstance(m, dict) or m.get("role") != "assistant":
+                        continue
+                    next_role = (
+                        raw_msgs[m_idx + 1].get("role")
+                        if m_idx + 1 < len(raw_msgs) and isinstance(raw_msgs[m_idx + 1], dict)
+                        else None
+                    )
+                    if (m.get("tool_calls") or next_role != "user") and m.get("reasoning_content") is None:
+                        needs_reasoning_heal = True
+                        break
+            if needs_reasoning_heal:
+                outbound_body = copy.deepcopy(outbound_body)
+                tc_to_reasoning: dict[str, str] = {}
+                text_to_reasoning: dict[str, str] = {}
+                for prev_s in tape_store.get_steps(session.tape_id):
+                    if prev_s.reasoning_text:
+                        for tc_inv in prev_s.tool_calls:
+                            if tc_inv.id:
+                                tc_to_reasoning[tc_inv.id] = prev_s.reasoning_text
+                        if prev_s.assembled_text:
+                            text_to_reasoning[prev_s.assembled_text[:120]] = prev_s.reasoning_text
+                out_msgs = outbound_body.get("messages") or []
+                for m_idx, m in enumerate(out_msgs):
+                    if not isinstance(m, dict) or m.get("role") != "assistant":
+                        continue
+                    next_role = (
+                        out_msgs[m_idx + 1].get("role")
+                        if m_idx + 1 < len(out_msgs) and isinstance(out_msgs[m_idx + 1], dict)
+                        else None
+                    )
+                    if (m.get("tool_calls") or next_role != "user") and m.get("reasoning_content") is None:
+                        recovered = ""
+                        for tc_dict in m.get("tool_calls") or []:
+                            if isinstance(tc_dict, dict) and tc_dict.get("id") in tc_to_reasoning:
+                                recovered = tc_to_reasoning[str(tc_dict["id"])]
+                                break
+                        if not recovered and isinstance(m.get("content"), str) and m["content"]:
+                            recovered = text_to_reasoning.get(m["content"][:120], "")
+                        m["reasoning_content"] = recovered
 
         if is_stream:
             t0 = time.perf_counter()
-            client = httpx.AsyncClient(timeout=120.0)
-            up_req = client.build_request("POST", target_url, json=outbound_body, headers=up_headers)
-            try:
-                up_resp = await client.send(up_req, stream=True)
-            except httpx.HTTPError as exc:
-                await client.aclose()
-                raise HTTPException(status_code=502, detail=f"Upstream connection error: {exc}") from exc
+            client, up_resp = await _open_stream_with_retry(target_url, outbound_body, up_headers)
 
             if up_resp.status_code >= 400:
                 err_bytes = await up_resp.aread()
@@ -243,15 +367,14 @@ def create_app(
             )
 
         t0 = time.perf_counter()
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            up_resp = await client.post(target_url, json=outbound_body, headers=up_headers)
-            if up_resp.status_code >= 400:
-                return Response(
-                    content=up_resp.content,
-                    status_code=up_resp.status_code,
-                    media_type=up_resp.headers.get("content-type", "application/json"),
-                )
-            resp_json = up_resp.json()
+        up_resp = await _post_json_with_retry(target_url, outbound_body, up_headers)
+        if up_resp.status_code >= 400:
+            return Response(
+                content=up_resp.content,
+                status_code=up_resp.status_code,
+                media_type=up_resp.headers.get("content-type", "application/json"),
+            )
+        resp_json = up_resp.json()
         total_ms = (time.perf_counter() - t0) * 1000.0
 
         with session.lock:
@@ -338,22 +461,29 @@ def create_app(
             outbound_body = apply_override_patch(body, applied_patch)
 
         upstream_override = request.headers.get("x-forktape-upstream")
+        anth_model_lower = str(outbound_body.get("model") or "").lower()
         if upstream_override:
             upstream_base = _validate_http_url(upstream_override, "X-ForkTape-Upstream").rstrip("/")
         else:
             upstream_base = cfg.anthropic_upstream.rstrip("/")
+            if anth_model_lower.startswith("deepseek") and upstream_base == "https://api.anthropic.com":
+                upstream_base = "https://api.deepseek.com/anthropic"
         target_url = f"{upstream_base}/messages" if upstream_base.endswith("/v1") else f"{upstream_base}/v1/messages"
         up_headers = _forward_upstream_headers(request)
+        has_anth_key = any(k.lower() in ("x-api-key", "authorization") for k in up_headers)
+        if not has_anth_key:
+            anth_env_key = (
+                os.environ.get("DEEPSEEK_API_KEY", "")
+                if ("deepseek" in upstream_base or anth_model_lower.startswith("deepseek"))
+                else ""
+            ) or os.environ.get("ANTHROPIC_API_KEY", "")
+            if anth_env_key:
+                up_headers["x-api-key"] = anth_env_key
+                up_headers.setdefault("anthropic-version", "2023-06-01")
 
         if is_stream:
             t0 = time.perf_counter()
-            client = httpx.AsyncClient(timeout=120.0)
-            up_req = client.build_request("POST", target_url, json=outbound_body, headers=up_headers)
-            try:
-                up_resp = await client.send(up_req, stream=True)
-            except httpx.HTTPError as exc:
-                await client.aclose()
-                raise HTTPException(status_code=502, detail=f"Upstream connection error: {exc}") from exc
+            client, up_resp = await _open_stream_with_retry(target_url, outbound_body, up_headers)
 
             if up_resp.status_code >= 400:
                 err_bytes = await up_resp.aread()
@@ -418,15 +548,14 @@ def create_app(
             )
 
         t0 = time.perf_counter()
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            up_resp = await client.post(target_url, json=outbound_body, headers=up_headers)
-            if up_resp.status_code >= 400:
-                return Response(
-                    content=up_resp.content,
-                    status_code=up_resp.status_code,
-                    media_type=up_resp.headers.get("content-type", "application/json"),
-                )
-            resp_json = up_resp.json()
+        up_resp = await _post_json_with_retry(target_url, outbound_body, up_headers)
+        if up_resp.status_code >= 400:
+            return Response(
+                content=up_resp.content,
+                status_code=up_resp.status_code,
+                media_type=up_resp.headers.get("content-type", "application/json"),
+            )
+        resp_json = up_resp.json()
         total_ms = (time.perf_counter() - t0) * 1000.0
 
         with session.lock:
@@ -620,6 +749,17 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            err_preview = exc.response.text[:400]
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM HTTP {exc.response.status_code}: {err_preview}",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM connection error: {exc}",
+            ) from exc
         return {
             "forked_tape": child_tape.model_dump(),
             "forked_step": forked_step.model_dump(),
@@ -635,15 +775,32 @@ def create_app(
         return comparison.model_dump()
 
     @app.post("/api/tapes/{tape_id}/doctor")
-    async def api_run_doctor(tape_id: str) -> dict[str, Any]:
+    async def api_run_doctor(
+        tape_id: str,
+        payload: DoctorRunPayload | None = None,
+    ) -> dict[str, Any]:
         from forktape.doctor.graph import run_counterfactual_biopsy
 
+        use_live = payload.prefer_live_upstream if payload is not None else False
         try:
-            report = await run_counterfactual_biopsy(tape_store, engine, tape_id)
+            report = await run_counterfactual_biopsy(
+                tape_store, engine, tape_id, prefer_live_upstream=use_live
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            err_preview = exc.response.text[:400]
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM HTTP {exc.response.status_code}: {err_preview}",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM connection error: {exc}",
+            ) from exc
         return report.model_dump()
 
     @app.get("/api/tapes/{tape_id}/export-pytest")
@@ -656,6 +813,17 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            err_preview = exc.response.text[:400]
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM HTTP {exc.response.status_code}: {err_preview}",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Upstream LLM connection error: {exc}",
+            ) from exc
         return {"tape_id": tape_id, "pytest_code": code}
 
     @app.get("/api/tapes/{tape_id}/bundle")

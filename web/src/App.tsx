@@ -306,6 +306,8 @@ export default function App() {
     try {
       const resp = await fetch(`/api/tapes/${detail.tape.tape_id}/doctor`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefer_live_upstream: preferLiveUpstream }),
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       await loadTapes(true);
@@ -1148,10 +1150,13 @@ export default function App() {
                             className="w-full bg-zinc-900 border border-white/[0.09] rounded-lg px-3 py-2 text-xs text-zinc-100 focus:outline-none focus:border-zinc-400"
                           >
                             <option value="">{t.keepModel(selectedStep.model)}</option>
+                            <option value="deepseek-flash">deepseek-flash (DeepSeek-V4.1-Flash)</option>
+                            <option value="deepseek-v4-pro">deepseek-v4-pro (DeepSeek-V4-Pro)</option>
+                            <option value="deepseek-chat">deepseek-chat</option>
+                            <option value="deepseek-reasoner">deepseek-reasoner</option>
                             <option value="gpt-4o">gpt-4o</option>
                             <option value="gpt-4.1-mini">gpt-4.1-mini</option>
                             <option value="claude-3-7-sonnet">claude-3-7-sonnet</option>
-                            <option value="deepseek-chat">deepseek-chat</option>
                             <option value="qwen-max">qwen-max</option>
                           </select>
                         </div>

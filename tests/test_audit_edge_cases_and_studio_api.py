@@ -613,3 +613,156 @@ async def test_web_studio_spa_and_full_rest_api_e2e(tmp_path: Path) -> None:
             imp_resp = await client.post("/api/tapes/import", json=bundle_json)
             assert imp_resp.status_code == 200
             assert (await client.get("/api/tapes/tape_demo_kv_cache_thrash")).status_code == 200
+
+
+async def test_deepseek_v4_1_reasoning_auto_heal_and_long_thread_heuristics(tmp_path: Path) -> None:
+    """Verify proxy auto-heals stripped reasoning_content for DeepSeek V4.1 and avoids log false-positives."""
+    from forktape.doctor.heuristics import _is_tool_output_error, scan_tape_anomalies
+    from forktape.models.tape import TapeStep, ToolCallInvocation
+
+    # 1. Healthy observability JSON containing 'ERROR'/'failed' inside log strings must NOT be flagged as tool error
+    healthy_log_json = json.dumps(
+        {"status": "ok", "pod_logs": ["2026-11-14 ERROR pool timeout", "2 replicas failed probe"]}
+    )
+    assert _is_tool_output_error(healthy_log_json) is False
+    assert _is_tool_output_error('{"status": "rejected", "error": "cap exceeded"}') is True
+
+    # 2. Intra-step parallel duplicate read calls must NOT trigger multi-step TOOL_CALL_LOOP
+    t_rec = TapeRecord(tape_id="parallel_ok", title="Parallel", status=TapeStatus.SUCCESS)
+    s_par = TapeStep(
+        tape_id="parallel_ok",
+        step_index=1,
+        raw_request={"model": "deepseek-flash", "messages": [{"role": "user", "content": "check"}]},
+        raw_response={},
+        tool_calls=[
+            ToolCallInvocation(id="c1", name="read_metric", arguments={"k": "cpu"}),
+            ToolCallInvocation(id="c2", name="read_metric", arguments={"k": "cpu"}),
+        ],
+    )
+    assert [f for f in scan_tape_anomalies(t_rec, [s_par]) if f.code == "TOOL_CALL_LOOP"] == []
+
+    # 3. Mock DeepSeek V4.1 upstream strictly enforcing `reasoning_content` on assistant tool_calls history
+    seen_payloads: list[dict[str, Any]] = []
+
+    async def strict_ds_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            content_length = 0
+            while True:
+                line = await reader.readline()
+                if not line or line in (b"\r\n", b"\n"):
+                    break
+                if line.lower().startswith(b"content-length:"):
+                    content_length = int(line.decode("ascii").split(":", 1)[1].strip())
+            raw_body = await reader.readexactly(content_length) if content_length else b"{}"
+            req_json = json.loads(raw_body.decode("utf-8"))
+            seen_payloads.append(req_json)
+
+            # Enforce DeepSeek V4.1 thinking-mode invariant on Turn 2+
+            for m in req_json.get("messages") or []:
+                if m.get("role") == "assistant" and m.get("tool_calls") and "reasoning_content" not in m:
+                    err = b'{"error":{"message":"The `reasoning_content` in the thinking mode must be passed back"}}'
+                    writer.write(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                        + f"Content-Length: {len(err)}\r\n\r\n".encode("ascii")
+                        + err
+                    )
+                    await writer.drain()
+                    return
+
+            if len(seen_payloads) == 1:
+                resp_obj = {
+                    "id": "ds-1",
+                    "model": "deepseek-flash",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "reasoning_content": "Need to inspect shard-01 first.",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_ds_01",
+                                        "type": "function",
+                                        "function": {"name": "probe", "arguments": '{"shard":"01"}'},
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 120, "completion_tokens": 25, "prompt_tokens_details": {"cached_tokens": 0}},
+                }
+            else:
+                resp_obj = {
+                    "id": "ds-2",
+                    "model": "deepseek-flash",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "All healthy."},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 180, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 128}},
+                }
+            out_bytes = json.dumps(resp_obj).encode("utf-8")
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(out_bytes)}\r\n\r\n".encode("ascii")
+                + out_bytes
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    srv = await asyncio.start_server(strict_ds_handler, "127.0.0.1", 0)
+    port = srv.sockets[0].getsockname()[1]
+    try:
+        cfg = ForkTapeConfig(
+            db_path=tmp_path / "ds_heal.db",
+            openai_upstream=f"http://127.0.0.1:{port}/v1",
+        )
+        with TapeStore(cfg.db_path) as store:
+            engine = ReplayEngine(store, cfg)
+            app = create_app(store=store, config=cfg, replay_engine=engine)
+            async with httpx.AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://forktape.local"
+            ) as client:
+                sid = (await client.post("/api/sessions/record", json={"title": "DS V4.1 Heal"})).json()["session_id"]
+                r1 = await client.post(
+                    f"/s/{sid}/v1/chat/completions",
+                    json={"model": "deepseek-flash", "messages": [{"role": "user", "content": "check shard"}]},
+                )
+                assert r1.status_code == 200
+                # Client strips reasoning_content on Turn 2 (classic OpenAI SDK pitfall!)
+                r2 = await client.post(
+                    f"/s/{sid}/v1/chat/completions",
+                    json={
+                        "model": "deepseek-flash",
+                        "messages": [
+                            {"role": "user", "content": "check shard"},
+                            {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_ds_01",
+                                        "type": "function",
+                                        "function": {"name": "probe", "arguments": '{"shard":"01"}'},
+                                    }
+                                ],
+                            },
+                            {"role": "tool", "tool_call_id": "call_ds_01", "content": '{"status":"ok"}'},
+                        ],
+                    },
+                )
+                assert r2.status_code == 200
+                assert seen_payloads[1]["messages"][1]["reasoning_content"] == "Need to inspect shard-01 first."
+                steps = store.get_steps(sid)
+                assert steps[0].cached_prompt_tokens == 0  # Preserved exact 0 server cache telemetry
+                assert steps[1].cached_prompt_tokens == 128
+    finally:
+        srv.close()
+        await srv.wait_closed()

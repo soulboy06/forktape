@@ -120,6 +120,17 @@ Reproduce every number locally in under 5 seconds:
 uv run python benchmarks/run_forkbench.py
 ```
 
+### 🔥 Real-World Long-Thread Validation (Live `DeepSeek-V4.1-Flash`)
+
+Beyond synthetic benchmarks, ForkTape's live integration suite (`tests/test_live_deepseek_long_threads.py`) validates multi-turn streaming SSE, hybrid-thinking `reasoning_content` auto-healing, dual-protocol (`/v1/chat/completions` + `/v1/messages`), and server-side KV caching against live **`DeepSeek-V4.1-Flash` (`deepseek-flash`)**:
+
+| Live Long-Thread Scenario | Scale & Workload | Measured Live Result |
+| :--- | :--- | :--- |
+| **19-Step SRE Incident + 44 Tools + 24.5KB K8s Dump** | `19` streaming steps (`304,673` prompt tokens) | Fork @ Step 17 saved **`241,877` VCR tokens**; single-step tokens cut **`21,020 → 3,576` (`-83.0%`)** |
+| **10-Step Prefix KV Cache Thrashing vs. Stabilized** | Volatile ms timestamp + shuffled tools | Real server-side DeepSeek KV cache hit rate jumped **`0.0% → 94.1%`** (LCP `0.8% → 100.0%`) |
+| **15-Step Client VCR Fast-Forward + Live Divergence** | `13` VCR steps + `2` live forked steps | **`7.86ms/step`** SSE VCR replay (`0` API tokens) → seamless live handover at Step 14 |
+| **13-Step FX Settlement Loop + Anthropic SSE + 4x WAL** | Hybrid thinking + `/v1/messages` + `4×5` parallel | Auto-healed stripped `reasoning_content`; `0` SQLite WAL lock errors; `0` secret leaks |
+
 ---
 
 ## 🛠️ CLI & SDK Quickstart

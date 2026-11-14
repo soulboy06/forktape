@@ -119,6 +119,17 @@ forktape demo
 uv run python benchmarks/run_forkbench.py
 ```
 
+### 🔥 真实大模型长线程实测（Live `DeepSeek-V4.1-Flash`）
+
+除离线基准外，ForkTape 还提供了针对真实线上 **`DeepSeek-V4.1-Flash` (`deepseek-flash`)** 的长线程集成测试套件（`tests/test_live_deepseek_long_threads.py`），完整覆盖混合思考模式 `reasoning_content` 自动容错回填、OpenAI/Anthropic 双协议流式拦截与服务端真实 KV Cache 验证：
+
+| 真实长线程压测场景 | 线程深度与负载规模 | 实测核心指标 |
+| :--- | :--- | :--- |
+| **19 步跨集群 SRE 排障（44 工具 + 24.5KB 脏日志）** | 连续 `19` 步流式调用（累计 `304,673` Token） | 第 17 步时间旅行分叉节省 **`241,877` VCR Token**；单步输入从 **`21,020` 降至 `3,576`（`-83.0%`）** |
+| **10 步动态毫秒时间戳与工具乱序 KV Cache 实测** | 每轮头部时间戳跳变 + 工具列表乱序 | DeepSeek 服务端**真实 KV Cache 命中率从 `0.0%` 跃升至 `94.1%`**（LCP `0.8% → 100.0%`） |
+| **15 步客户端全链路 VCR 快进 + 中途真实分叉** | 前 `13` 步快进重放 + 第 `14–15` 步真实推理 | 前 13 步流式快进均值 **`7.86ms/步`**（`0` Token），第 14 步无缝切换真实大模型分叉 |
+| **13 步清结算死循环 + Anthropic 双协议 + 4 并发** | 混合思考 + `/v1/messages` + `4×5` 步并发 | 自动修复客户端漏传 `reasoning_content` 400 报错；SQLite WAL 零锁冲突、零密钥泄漏 |
+
 ---
 
 ## 🛠️ 快速上手指南

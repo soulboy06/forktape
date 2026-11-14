@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
@@ -516,37 +517,98 @@ class LiveUpstreamStepExecutor:
     ) -> tuple[dict[str, Any], float, float]:
         payload = copy.deepcopy(request)
         payload["stream"] = False
+        payload.pop("stream_options", None)
+
+        model_name = str(payload.get("model") or "").lower()
+        if "reasoner" in model_name:
+            payload.pop("temperature", None)
+        if "reasoner" in model_name or model_name.startswith("deepseek"):
+            msg_list = payload.get("messages") or []
+            for m_idx, m in enumerate(msg_list):
+                if not isinstance(m, dict) or m.get("role") != "assistant":
+                    continue
+                next_role = (
+                    msg_list[m_idx + 1].get("role")
+                    if m_idx + 1 < len(msg_list) and isinstance(msg_list[m_idx + 1], dict)
+                    else None
+                )
+                if (m.get("tool_calls") or next_role != "user") and m.get("reasoning_content") is None:
+                    m["reasoning_content"] = ""
+
         req_headers = {"Content-Type": "application/json"}
         if headers:
             req_headers.update(headers)
 
         if provider == "anthropic":
             base = self.config.anthropic_upstream.rstrip("/")
+            if model_name.startswith("deepseek") and base == "https://api.anthropic.com":
+                base = "https://api.deepseek.com/anthropic"
             url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
-            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            api_key = (
+                os.environ.get("DEEPSEEK_API_KEY", "")
+                if ("deepseek" in base or model_name.startswith("deepseek"))
+                else ""
+            ) or os.environ.get("ANTHROPIC_API_KEY", "")
             if api_key and "x-api-key" not in {k.lower() for k in req_headers}:
                 req_headers["x-api-key"] = api_key
                 req_headers.setdefault("anthropic-version", "2023-06-01")
         else:
             base = self.config.openai_upstream.rstrip("/")
+            if model_name.startswith("deepseek") and base == "https://api.openai.com/v1":
+                base = "https://api.deepseek.com/v1"
             url = f"{base}/chat/completions"
-            api_key = os.environ.get("OPENAI_API_KEY", "")
+            api_key = (
+                os.environ.get("DEEPSEEK_API_KEY", "")
+                if "deepseek" in base or model_name.startswith("deepseek")
+                else ""
+            ) or os.environ.get("OPENAI_API_KEY", "")
             if api_key and "authorization" not in {k.lower() for k in req_headers}:
                 req_headers["Authorization"] = f"Bearer {api_key}"
 
         t0 = time.perf_counter()
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(url, json=payload, headers=req_headers)
-            resp.raise_for_status()
-            data = resp.json()
+        is_local = "127.0.0.1" in url or "localhost" in url
+        max_attempts = 1 if is_local else 3
+        last_exc: Exception | None = None
+        data: dict[str, Any] = {}
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(url, json=payload, headers=req_headers)
+                    if not is_local and resp.status_code in (502, 503, 504) and attempt < max_attempts:
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    last_exc = None
+                    break
+            except httpx.TransportError as exc:
+                last_exc = exc
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+                else:
+                    raise
+
+        if last_exc is not None:
+            raise last_exc
         dur_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return data, round(dur_ms * 0.35, 2), dur_ms
 
 
 def has_live_api_credentials(provider: str, config: ForkTapeConfig) -> bool:
     if provider == "anthropic":
-        return bool(os.environ.get("ANTHROPIC_API_KEY")) or "127.0.0.1" in config.anthropic_upstream or "localhost" in config.anthropic_upstream
-    return bool(os.environ.get("OPENAI_API_KEY")) or "127.0.0.1" in config.openai_upstream or "localhost" in config.openai_upstream
+        return (
+            bool(os.environ.get("ANTHROPIC_API_KEY"))
+            or bool(os.environ.get("DEEPSEEK_API_KEY"))
+            or "127.0.0.1" in config.anthropic_upstream
+            or "localhost" in config.anthropic_upstream
+        )
+    return (
+        bool(os.environ.get("OPENAI_API_KEY"))
+        or bool(os.environ.get("DEEPSEEK_API_KEY"))
+        or "127.0.0.1" in config.openai_upstream
+        or "localhost" in config.openai_upstream
+    )
 
 
 class ReplayEngine:
@@ -673,7 +735,21 @@ class ReplayEngine:
             o_tok = estimate_tokens(text + json.dumps([tc.model_dump() for tc in invocations]))
 
         cache_analysis = analyze_prefix_cache_continuity(prev_raw_request, clean_req)
-        if c_tok <= 0 and prev_raw_request is not None and cache_analysis.ratio >= 0.90:
+        usage_obj = clean_resp.get("usage") if isinstance(clean_resp.get("usage"), dict) else {}
+        has_explicit_cache_usage = (
+            (
+                isinstance(usage_obj.get("prompt_tokens_details"), dict)
+                and "cached_tokens" in usage_obj["prompt_tokens_details"]
+            )
+            or ("prompt_cache_hit_tokens" in usage_obj)
+            or ("cache_read_input_tokens" in usage_obj)
+        )
+        if (
+            not has_explicit_cache_usage
+            and c_tok <= 0
+            and prev_raw_request is not None
+            and cache_analysis.ratio >= 0.90
+        ):
             c_tok = int(p_tok * cache_analysis.ratio * 0.85)
 
         cost = estimate_cost_usd(model, p_tok, c_tok, o_tok)
@@ -762,7 +838,11 @@ class ReplayEngine:
         else:
             executor = self.offline_executor
 
-        raw_resp, ttft_ms, dur_ms = await executor.execute_step(provider, mutated_req)
+        try:
+            raw_resp, ttft_ms, dur_ms = await executor.execute_step(provider, mutated_req)
+        except Exception:
+            self.store.delete_tape(session.tape_id)
+            raise
         forked_step = self.build_and_store_live_step(
             tape_id=session.tape_id,
             step_index=step_index,

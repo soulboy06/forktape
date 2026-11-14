@@ -42,6 +42,24 @@ const DEMO_TAPE_ZH: Record<
     playbook:
       "1. 严禁在 System Prompt 顶部放置秒级时间戳、随机 Trace ID 或会话 Nonce（如需时间信息请置于末尾用户消息或按小时/天粒度对齐）。\n2. 对 `tools` JSON Schema 数组按工具名称做确定性固定排序后再发送给推理引擎。",
   },
+  tape_live_ds_long_20step_sre: {
+    title: "[真实 DeepSeek-V4.1-Flash · 19步超长线程] 跨集群支付事故排障（44 工具 + 24KB 脏日志膨胀）",
+    failureReason:
+      "连续 19 步真实流式调用累计消耗 304,673 输入 Token；第 5 步注入 24.5KB 原始 K8s 转储后引发后续 14 步严重上下文膨胀（单步达 21,616 Token）。",
+  },
+  tape_live_ds_long_loop_rag: {
+    title: "[真实 DeepSeek-V4.1-Flash · 13步长线程] 跨境清结算核账 Agent（深层空检索与死循环重试）",
+    failureReason:
+      "完成 9 批对账后，在第 10–12 步连续 3 次以相同参数调用 `search_swift_dispute_wire(SWIFT-ghost-991)` 返回空数组 `[]`，触发循环熔断。",
+  },
+  tape_live_ds_kv_thrash: {
+    title: "[真实 DeepSeek-V4.1-Flash · 10步] 动态毫秒时间戳与工具乱序击穿真实 KV Cache 实测",
+    failureReason:
+      "每轮变更 System Prompt 顶部毫秒时间戳并打乱工具列表顺序，导致 DeepSeek 服务端真实 KV Cache 命中率跌至 0.0%（开启稳定化后实测恢复至 94.1%）。",
+  },
+  tape_live_ds_anthropic_sse: {
+    title: "[真实 DeepSeek-V4.1-Flash · 双协议] Anthropic /v1/messages 流式多步工具调用实测",
+  },
 };
 
 const ROOT_CAUSE_LABELS: Record<string, { zh: string; en: string }> = {
@@ -211,7 +229,7 @@ export const UI_TEXT = {
     sandboxTitle: "MCP 破坏性写操作沙箱",
     sandboxDesc: "自动拦截 delete_* / wipe_* / send_* 等危险外部变更调用",
     liveApiTitle: "优先调用真实上游大模型",
-    liveApiDesc: "若已配置 OPENAI_API_KEY / ANTHROPIC_API_KEY 则发起真实推理",
+    liveApiDesc: "若已配置 DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY 则发起真实推理",
     appendGuardLabel: "追加 System 强约束护栏（可选）",
     insertPreset: "+ 填入防空检索幻觉模板",
     appendPlaceholder: "例如：当查询返回空结果时严禁猜测单号；单笔自动退款上限 500 元...",
@@ -308,7 +326,7 @@ export const UI_TEXT = {
     sandboxTitle: "MCP Dry-Run Write Sandbox",
     sandboxDesc: "Intercept destructive calls (delete_*, wipe_*, send_*)",
     liveApiTitle: "Prefer Live Upstream LLM API",
-    liveApiDesc: "Call live model when OPENAI_API_KEY / ANTHROPIC_API_KEY is set",
+    liveApiDesc: "Call live model when DEEPSEEK_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY is set",
     appendGuardLabel: "Append System Guardrail (Optional)",
     insertPreset: "+ Empty-Retrieval Guard Preset",
     appendPlaceholder: "e.g. Never invoke admin wipe tools; cap autonomous refunds at $500...",

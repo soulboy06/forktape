@@ -306,7 +306,9 @@ def analyze_prefix_cache_continuity(
         return PrefixCacheAnalysis(ratio=1.0)
 
     prev_msgs = prev_request.get("messages")
+    curr_msgs = curr_request.get("messages")
     prev_msg_count = len(prev_msgs) if isinstance(prev_msgs, list) else 0
+    curr_msg_count = len(curr_msgs) if isinstance(curr_msgs, list) else 0
     prev_stream = serialize_prompt_prefix_for_kv_cache(prev_request, max_messages=prev_msg_count)
     curr_stream = serialize_prompt_prefix_for_kv_cache(curr_request, max_messages=prev_msg_count)
 
@@ -315,6 +317,10 @@ def analyze_prefix_cache_continuity(
 
     limit = min(len(prev_stream), len(curr_stream))
     lcp = 0
+    # Fast C-speed 4KB slice stride before fine-grained character scan for 200KB+ long threads
+    stride = 4096
+    while lcp + stride <= limit and prev_stream[lcp : lcp + stride] == curr_stream[lcp : lcp + stride]:
+        lcp += stride
     while lcp < limit and prev_stream[lcp] == curr_stream[lcp]:
         lcp += 1
 
@@ -325,7 +331,12 @@ def analyze_prefix_cache_continuity(
     start = max(0, lcp - 24)
     prev_frag = prev_stream[start : lcp + 48].replace("\n", " ")
     curr_frag = curr_stream[start : lcp + 48].replace("\n", " ")
-    snippet = f"Prev@{lcp}: «{prev_frag}»  !=  Curr@{lcp}: «{curr_frag}»"
+    trunc_note = (
+        f" [sliding-window drop: {prev_msg_count}->{curr_msg_count} msgs]"
+        if curr_msg_count < prev_msg_count
+        else ""
+    )
+    snippet = f"Prev@{lcp}: «{prev_frag}»  !=  Curr@{lcp}: «{curr_frag}»{trunc_note}"
     return PrefixCacheAnalysis(
         ratio=ratio,
         break_offset=lcp,

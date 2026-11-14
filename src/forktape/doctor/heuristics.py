@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from forktape.models.tape import AnomalyFlag, MCPSpan, TapeRecord, TapeStep
+from forktape.models.tape import AnomalyFlag, MCPSpan, TapeRecord, TapeStatus, TapeStep
 
 ENTITY_ID_RE = re.compile(r"\b(?:ORD|INC|TKT|USR|INV|TXN)[-_]\d{3,}\b")
 EMPTY_PAYLOAD_MARKERS = {
@@ -103,10 +103,55 @@ def _collect_grounded_corpus_before_step(request: dict[str, Any]) -> str:
     return " ".join(json.dumps(m, ensure_ascii=False) for m in msgs)
 
 
+def _is_tool_output_error(out: str) -> bool:
+    """Distinguish genuine tool/policy execution errors from healthy observability logs."""
+    stripped = out.strip()
+    if not stripped:
+        return False
+    error_tokens = (
+        "error",
+        "invalid",
+        "denied",
+        "exceed",
+        "not_found",
+        "not found",
+        "deprecated",
+        "failed",
+        "rejected",
+    )
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            if parsed.get("is_error") is True or parsed.get("ok") is False:
+                return True
+            if parsed.get("error") or parsed.get("exception"):
+                return True
+            status_val = str(parsed.get("status") or "").lower()
+            if status_val:
+                if status_val in ("ok", "healthy", "success", "completed", "ready", "green"):
+                    return False
+                if any(tok in status_val for tok in error_tokens):
+                    return True
+            if parsed.get("ok") is True:
+                return False
+            if len(stripped) < 600:
+                out_l = stripped.lower()
+                return any(tok in out_l for tok in error_tokens)
+            return False
+    except (ValueError, TypeError):
+        pass
+
+    if len(stripped) < 600:
+        out_l = stripped.lower()
+        return any(tok in out_l for tok in error_tokens)
+    return False
+
+
 def _did_step_trigger_downstream_tool_error(
     step_pos: int,
     steps: list[TapeStep],
     mcp_spans: list[MCPSpan] | None,
+    tape_failed: bool = True,
 ) -> bool:
     """Forward Causal Consequence Check: inspect whether Step `k`'s tool call returned an error
     in Step `k+1`'s incoming tool messages or MCP spans (domain-agnostic!).
@@ -119,22 +164,10 @@ def _did_step_trigger_downstream_tool_error(
     if step_pos + 1 < len(steps):
         next_msgs = steps[step_pos + 1].raw_request.get("messages") or []
         tool_outs = _extract_preceding_tool_messages({"messages": next_msgs})
-        error_tokens = (
-            "error",
-            "invalid",
-            "denied",
-            "exceed",
-            "not_found",
-            "not found",
-            "deprecated",
-            "failed",
-            "rejected",
-        )
         for out in tool_outs:
-            out_l = out.lower()
-            if any(tok in out_l for tok in error_tokens):
+            if _is_tool_output_error(out):
                 return True
-    return step_pos == len(steps) - 1 and len(curr.tool_calls) > 0
+    return tape_failed and step_pos == len(steps) - 1 and len(curr.tool_calls) > 0
 
 
 def scan_tape_anomalies(
@@ -145,20 +178,26 @@ def scan_tape_anomalies(
     """Scan an agent trajectory for 5 canonical engineering failure modes + forward causal errors."""
     findings: list[AnomalyFlag] = []
     seen_call_signatures: dict[str, list[int]] = {}
+    tape_failed = tape.status != TapeStatus.SUCCESS
 
     for pos, step in enumerate(steps):
         idx = step.step_index
         req = step.raw_request
         tools_list = req.get("tools") if isinstance(req.get("tools"), list) else []
         msgs = req.get("messages") if isinstance(req.get("messages"), list) else []
-        caused_downstream_error = _did_step_trigger_downstream_tool_error(pos, steps, mcp_spans)
+        caused_downstream_error = _did_step_trigger_downstream_tool_error(
+            pos, steps, mcp_spans, tape_failed=tape_failed
+        )
 
-        # 1. TOOL_CALL_LOOP: Repeated identical (tool_name, canonical_args) calls
+        # 1. TOOL_CALL_LOOP: Repeated identical (tool_name, canonical_args) calls across distinct steps
+        emitted_loop_sigs_in_step: set[str] = set()
         for tc in step.tool_calls:
             sig = f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)}"
             history = seen_call_signatures.setdefault(sig, [])
-            history.append(idx)
-            if len(history) >= 2:
+            if idx not in history:
+                history.append(idx)
+            if len(history) >= 2 and sig not in emitted_loop_sigs_in_step:
+                emitted_loop_sigs_in_step.add(sig)
                 findings.append(
                     AnomalyFlag(
                         code="TOOL_CALL_LOOP",
@@ -166,7 +205,7 @@ def scan_tape_anomalies(
                         step_index=idx,
                         title=f"Repeated Tool Call Loop (`{tc.name}`)",
                         detail=(
-                            f"Tool `{tc.name}` was invoked with identical arguments at steps {history}, "
+                            f"Tool `{tc.name}` was invoked with identical arguments across steps {history}, "
                             "indicating non-progressing retry/state loop."
                         ),
                         evidence={"tool": tc.name, "steps": list(history), "arguments": tc.arguments},

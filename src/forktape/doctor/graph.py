@@ -34,6 +34,7 @@ class BiopsyGraphState(TypedDict, total=False):
     tape_id: str
     tape: TapeRecord
     steps: list[TapeStep]
+    prefer_live_upstream: bool
     findings: list[AnomalyFlag]
     drift_step: int
     initial_category: str
@@ -69,12 +70,11 @@ def _did_ablation_resolve_step(
         before_cnt = len(orig_step.raw_request.get("tools") or [])
         after_cnt = len(forked_step.raw_request.get("tools") or [])
         notes.append(f"Pruned tool schemas from {before_cnt} down to {after_cnt} via BM25.")
+        distractor_markers = ("deprecated", "legacy", "internal_admin", "wrong_", "wipe", "force_drop", "bypass_")
         eliminated_distractor = any(
-            "deprecated" in t.lower() or "legacy" in t.lower() or "internal_admin" in t.lower() or "wrong_" in t.lower()
-            for t in orig_tools
+            any(m in t.lower() for m in distractor_markers) for t in orig_tools
         ) and not any(
-            "deprecated" in t.lower() or "legacy" in t.lower() or "internal_admin" in t.lower() or "wrong_" in t.lower()
-            for t in new_tools
+            any(m in t.lower() for m in distractor_markers) for t in new_tools
         )
         cleaned_warning = "unpruned" not in new_args_str and (orig_tools != new_tools or orig_args_str != new_args_str)
         if eliminated_distractor or (before_cnt >= 20 and cleaned_warning):
@@ -106,10 +106,14 @@ def _did_ablation_resolve_step(
 
     if operator == "empty_retrieval_guard":
         had_empty_flag = any(f.code == "SILENT_EMPTY_RETRIEVAL" for f in findings_at_step)
+        txt_l = forked_step.assembled_text.lower()
         halted_fabrication = had_empty_flag and (
             len(forked_step.tool_calls) == 0
-            or "clarification" in forked_step.assembled_text.lower()
-            or "no matching" in forked_step.assembled_text.lower()
+            or "clarification" in txt_l
+            or "no matching" in txt_l
+            or "empty" in txt_l
+            or "未找到" in txt_l
+            or "确认" in txt_l
         )
         if halted_fabrication:
             notes.append("Prevented ungrounded ID fabrication; model safely escalated on empty tool output.")
@@ -128,7 +132,9 @@ def _did_ablation_resolve_step(
 
     if operator == "loop_breaker_guard":
         had_loop = any(f.code == "TOOL_CALL_LOOP" for f in findings_at_step)
-        broke_repeat = had_loop and (new_tools != orig_tools or len(new_tools) == 0)
+        broke_repeat = had_loop and (
+            new_tools != orig_tools or orig_args_str != new_args_str or len(new_tools) == 0
+        )
         if broke_repeat:
             notes.append("Broke repeated identical tool-call cycle via explicit state-transition guard.")
             return True, notes
@@ -142,7 +148,11 @@ def _best_step_for_code(findings: list[AnomalyFlag], code: str, fallback: int) -
     if not matching:
         return fallback
     critical = [f for f in matching if f.severity == "critical"]
-    chosen = critical[0] if critical else matching[0]
+    if critical:
+        chosen = critical[0]
+    else:
+        at_fallback = [f for f in matching if f.step_index == fallback]
+        chosen = at_fallback[0] if at_fallback else matching[-1]
     if code == "TOOL_CALL_LOOP":
         rep = chosen.evidence.get("steps") or [chosen.step_index]
         return int(rep[1]) if len(rep) >= 2 else chosen.step_index
@@ -334,7 +344,7 @@ def build_biopsy_langgraph(store: TapeStore, engine: ReplayEngine) -> Any:
                 source_tape_id=tape_id,
                 step_index=s_idx,
                 patch=hyp["patch"],
-                prefer_live_upstream=False,
+                prefer_live_upstream=bool(state.get("prefer_live_upstream", False)),
             )
 
             step_findings = [f for f in findings if f.step_index == s_idx] or findings
@@ -508,6 +518,7 @@ async def run_counterfactual_biopsy(
     store: TapeStore,
     engine: ReplayEngine,
     tape_id: str,
+    prefer_live_upstream: bool = False,
 ) -> BiopsyReport:
     """Execute the full LangGraph Counterfactual Biopsy pipeline on `tape_id`."""
     tape = store.get_tape(tape_id)
@@ -523,6 +534,7 @@ async def run_counterfactual_biopsy(
             "tape_id": tape_id,
             "tape": tape,
             "steps": steps,
+            "prefer_live_upstream": prefer_live_upstream,
             "started_at_perf": time.perf_counter(),
         }
     )

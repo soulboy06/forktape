@@ -159,7 +159,11 @@ def compact_bloated_tool_content(raw_content: str, max_chars: int) -> str:
         pass
 
     half = max(120, max_chars // 2 - 20)
-    return f"{raw_content[:half]}\n...[ForkTape compacted {len(raw_content) - 2 * half} chars]...\n{raw_content[-half:]}"
+    return (
+        f"{raw_content[:half]}\n"
+        f"...[ForkTape compacted {len(raw_content) - 2 * half} chars (_forktape_compacted)]...\n"
+        f"{raw_content[-half:]}"
+    )
 
 
 def apply_override_patch(request: dict[str, Any], patch: OverridePatch | None) -> dict[str, Any]:
@@ -237,9 +241,9 @@ def apply_override_patch(request: dict[str, Any], patch: OverridePatch | None) -
                 key=lambda t: str((t.get("function") or t).get("name", "")),
             )
 
-    # 3. BM25 Semantic Tool Pruning (keeps tools already invoked in OpenAI OR Anthropic history + Top-K)
+    # 3. BM25 Semantic Tool Pruning (keeps tools invoked in Anthropic history or recent OpenAI turns + Top-K)
     if patch.prune_tools_top_k is not None and isinstance(mutated.get("tools"), list):
-        historically_used: set[str] = set()
+        ordered_used: list[str] = []
         if isinstance(messages, list):
             for m in messages:
                 if not isinstance(m, dict):
@@ -248,17 +252,25 @@ def apply_override_patch(request: dict[str, Any], patch: OverridePatch | None) -
                     if isinstance(tc, dict):
                         fn_name = (tc.get("function") or {}).get("name")
                         if fn_name:
-                            historically_used.add(str(fn_name))
+                            s_name = str(fn_name)
+                            if s_name in ordered_used:
+                                ordered_used.remove(s_name)
+                            ordered_used.append(s_name)
                 if isinstance(m.get("content"), list):
                     for block in m["content"]:
                         if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
-                            historically_used.add(str(block["name"]))
+                            s_name = str(block["name"])
+                            if s_name in ordered_used:
+                                ordered_used.remove(s_name)
+                            ordered_used.append(s_name)
+        # Anthropic validates all historical tool_use names; OpenAI/DeepSeek long threads only need recent context
+        retained_used = set(ordered_used) if is_anth else set(ordered_used[-3:])
         query = _extract_query_from_messages(mutated)
         mutated["tools"] = prune_tools_bm25_preserving_order(
             mutated["tools"],
             query_text=query,
             top_k=patch.prune_tools_top_k,
-            required_tool_names=historically_used,
+            required_tool_names=retained_used,
         )
 
     # 4. Context Tool Output Compaction (compacts OpenAI role='tool' AND Anthropic tool_result str/list)

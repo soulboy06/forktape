@@ -31,5 +31,5 @@
     "full_rerun_tokens_total": 374706,
     "forktape_targeted_tokens_total": 41455
   },
-  "benchmark_wall_time_sec": 0.95
+  "benchmark_wall_time_sec": 1.09
 }
